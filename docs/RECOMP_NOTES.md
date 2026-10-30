@@ -93,3 +93,15 @@ from the ELF's own symbols.
 - Boot 8 (START every 4 s, X 2 s after): the desk title stays from 28 s to 80 s, then New game: "DARK SHRINE" and the
   field HUD (the compass); START every 4 s then toggles the pause. The 3D field behind the HUD stays nearly black
   (mean brightness 3 of 255): to look at next.
+
+## Boots 9-14: scripted input, New game, the opening
+
+- Pad scripts never reached the game in boots 9-11. Two causes, both on the host side: a gamepad plugged into the PC
+  (boot tests now set `PS2X_PAD_NO_HOST=1`), and environment variables put in front of a command from Git's bash,
+  which do not reach MSYS2's bash when `/c/msys64/usr/bin` comes first in `PATH`: they are exported inside
+  `bash -c '...'` now, and each boot saves what it got in `build/boots/<name>/env.txt`.
+- Title flow: START skips the intro to the logo, START at the logo opens the desk (the menu answers from about 80 s
+  in), X starts New game, then the name entry (X types letters; START jumps to DECIDE, X accepts).
+- Boot 14: the opening in the Dark Shrine plays: Colonel Flag and his soldiers, the urn, the Dark Genie, with the
+  dialogue text; 56-60 fps on the native frame loop. The dark field of boot 8 was the pause (START every 4 s).
+- Open: while a dialogue line shows, the whole screen behind the text window is a striped beige instead of the scene.
