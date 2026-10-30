@@ -14,3 +14,9 @@ JOBS="${JOBS:-$(nproc)}"
 # Native executables carry .exe on Windows (MSYS2).
 EXE=""
 case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) EXE=".exe" ;; esac
+
+# GCC needs a temporary folder; a shell started without TMP/TEMP sends it to C:\Windows (refused).
+if [ -z "${TMP:-}" ] || [ -z "${TEMP:-}" ]; then
+    mkdir -p "$ROOT/build/tmp"
+    export TMP="$ROOT/build/tmp" TEMP="$ROOT/build/tmp"
+fi
