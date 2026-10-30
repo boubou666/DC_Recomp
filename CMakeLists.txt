@@ -15,6 +15,8 @@ set(PS2X_BUILD_RECOMP OFF CACHE BOOL "" FORCE)
 set(PS2X_BUILD_ANALYZER OFF CACHE BOOL "" FORCE)
 set(PS2X_BUILD_TEST OFF CACHE BOOL "" FORCE)
 set(PS2X_BUILD_STUDIO OFF CACHE BOOL "" FORCE)
+# A total recompilation: the native GS renderer draws everything, paraLLEl-GS (GS emulation) is not even built in.
+set(PS2X_ENABLE_PARALLEL_GS OFF CACHE BOOL "" FORCE)
 
 add_subdirectory(PS2Recomp)
 
