@@ -11,6 +11,8 @@ native() { command -v cygpath > /dev/null && cygpath -m "$1" || echo "$1"; }
 # gamepad kept the live input file from reaching the game (boot 9). PS2X_PAD_NO_HOST=0 to play along.
 export PS2X_PAD_NO_HOST="${PS2X_PAD_NO_HOST:-1}"
 export PS2X_CAPTURE_DIR="$(native "$OUT")" PS2X_CAPTURE_INTERVAL="$INTERVAL"
+# The settings this run got (a variable set in front of a command in another bash may not reach it: set them inside).
+env | grep -E "^(PS2X_|DC_)" > "$OUT/env.txt" || true
 timeout "$SECS" "$ROOT/scripts/run.sh" > "$OUT/run.log" 2>&1
 code=$?
 echo "boot $NAME: exit $code after <= ${SECS}s, $(ls "$OUT"/*.png 2>/dev/null | wc -l) frames, $(wc -l < "$OUT/run.log") log lines"
