@@ -40,7 +40,7 @@ not used.
 | Boot: EE kernel, CD reads from the disc files, memory card detected | ✅ |
 | The game's IOP modules recompiled to native code (9 modules, nothing interpreted) | ✅ |
 | Intro, title screen, in-game 3D scenes after the title (native GS renderer) | ✅ |
-| New game: the Dark Shrine | 🔧 |
+| New game: name entry, the Dark Shrine | 🔧 |
 | Norune village | ⏳ |
 | First dungeon (Divine Beast Cave) | ⏳ |
 | Sound and music: SDRDRV, EzMIDI and LIBSD native, voice transfers complete | 🔧 |
@@ -62,7 +62,7 @@ The first boots on the full native path (native GS renderer, native IOP modules,
 |---|---|---|
 | ![The intro's castle](docs/screenshots/intro-castle.png) | ![The Dark Genie](docs/screenshots/genie.png) | ![The title logo](docs/screenshots/title-logo.png) |
 | ![The title screen](docs/screenshots/opening-desk.png) | ![In a dungeon](docs/screenshots/dungeon-scene.png) | ![Toan and the Fairy King](docs/screenshots/fairy-king.png) |
-| ![Toan's house](docs/screenshots/toan-house.png) | ![The forest](docs/screenshots/forest-scene.png) | |
+| ![Toan's house](docs/screenshots/toan-house.png) | ![The forest](docs/screenshots/forest-scene.png) | ![New game: the name entry](docs/screenshots/register-name.png) |
 
 ## How it works
 
