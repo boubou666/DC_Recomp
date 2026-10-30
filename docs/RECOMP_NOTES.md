@@ -120,3 +120,18 @@ from the ELF's own symbols.
   (The Third Age stubs it too; reported on f2f).
 - Still open: the window shows the picture with a black band on the left and its right edge cut (presentation
   offset); the dialogue backdrop (PSMT8 read of a CT32 target).
+
+## Boot 15: past the opening, Norune (2026-10-30, paused here)
+
+- 10 min scripted run (X every 2 s after the name entry): the Dark Shrine scene ends (the Genie, Colonel Flag), then
+  Norune's scenes: the village at night, Toan eating at home, the festival around the shrine fire; 52-58 fps.
+- Open, in order:
+  1. Black checkerboard blocks over parts of some Norune scenes (texture pages missing or stale in the GS native back
+     end). This run used a local, unpushed merge of `native/gs-backend` acd11f5 into `dc/native` (the 5 partial-FBMSK
+     hunks resolved to the gs-backend side, as `jc2/native` af3cc76); to compare with `native/renderer` alone and with
+     VP2S's `native/gs-backend-on-renderer` once it is up.
+  2. The dialogue backdrop: DC reads its CT32 target back as PSMT8 with a CLUT (channel shuffle, likely a sepia copy
+     of the scene); striped on the native back end. VP2S has a native-path GS recording of it (dc_dialogue2.gsr).
+  3. Control of Toan in Norune not reached yet in the scripted runs.
+- Tooling: window at 4:3 (`PS2X_WINDOW_SIZE=960x720` in `scripts/run.sh`), boot tests ignore the PC's gamepads and
+  save their settings in `env.txt`.

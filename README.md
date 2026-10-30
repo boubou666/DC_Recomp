@@ -41,7 +41,7 @@ not used.
 | The game's IOP modules recompiled to native code (9 modules, nothing interpreted) | ✅ |
 | Intro, title screen, in-game 3D scenes after the title (native GS renderer) | ✅ |
 | New game: name entry, the Dark Shrine opening (Colonel Flag summons the Genie) | ✅ |
-| Norune village | ⏳ |
+| Norune village: the opening scenes after the Dark Shrine | 🔧 |
 | First dungeon (Divine Beast Cave) | ⏳ |
 | Sound and music: SDRDRV, EzMIDI and LIBSD native, voice transfers complete | 🔧 |
 | Native frame loop (no vblank pacing): 60 fps on the PC clock | ✅ |
@@ -64,7 +64,8 @@ The first boots on the full native path (native GS renderer, native IOP modules,
 | ![The desk narration](docs/screenshots/opening-desk.png) | ![In a dungeon](docs/screenshots/dungeon-scene.png) | ![Toan and the Fairy King](docs/screenshots/fairy-king.png) |
 | ![Toan's house](docs/screenshots/toan-house.png) | ![The forest](docs/screenshots/forest-scene.png) | ![New game: the name entry](docs/screenshots/register-name.png) |
 | ![The Dark Shrine](docs/screenshots/shrine-soldiers.png) | ![Colonel Flag](docs/screenshots/colonel-flag.png) | ![The urn](docs/screenshots/shrine-urn.png) |
-| ![Opening dialogue](docs/screenshots/opening-dialogue.png) | ![The Dark Genie rises](docs/screenshots/genie-rises.png) | |
+| ![Opening dialogue](docs/screenshots/opening-dialogue.png) | ![The Dark Genie rises](docs/screenshots/genie-rises.png) | ![Norune at night](docs/screenshots/norune-night.png) |
+| ![Toan at home](docs/screenshots/norune-house.png) | ![Norune's festival](docs/screenshots/norune-festival.png) | |
 
 ## How it works
 
