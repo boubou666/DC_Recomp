@@ -25,21 +25,23 @@ Not an emulator: the game's own MIPS R5900 code, rebuilt as a native program on 
 
 ## Status
 
-**Bring-up.** A total recompilation like the other ports of the fork: the game's code, its overlays, its IOP modules
+**Bring-up, not playable yet.** On the full native path the game boots, finds its memory card, plays its 3D intro
+and shows the title logo and the opening scene. A total recompilation like the other ports of the fork: the game's code, its overlays, its IOP modules
 and its VU1 microcode all run as native code, drawn by the native GS renderer. Nothing is emulated, and paraLLEl-GS is
 not used.
 
 | Milestone | |
 |---|:---:|
 | Function map from the ELF's own symbol table (main program and both overlays, no Ghidra) | ✅ |
-| Recompile the main ELF and link it with the PS2Recomp runtime (Windows) | 🔧 |
-| Code overlays `TITLE.BIN` and `DUN.BIN` (one load slot, picked by their header) | 🔧 |
-| VU1 microcode compiled ahead of time (`ps2_vu_aot`) | 🔧 |
-| Boot: EE kernel, CD reads from the disc files | ⏳ |
-| The game's IOP modules recompiled to native code | ⏳ |
-| Title screen, New game, Norune village | ⏳ |
+| Recompile the main ELF and link it with the PS2Recomp runtime (Windows) | ✅ |
+| Code overlays `TITLE.BIN` and `DUN.BIN` (one load slot, picked by their header) | ✅ |
+| VU1 microcode compiled ahead of time (`ps2_vu_aot`) | ✅ |
+| Boot: EE kernel, CD reads from the disc files, memory card detected | ✅ |
+| The game's IOP modules recompiled to native code (9 modules, nothing interpreted) | ✅ |
+| Intro, title logo, opening scene (native GS renderer) | ✅ |
+| New game, Norune village | ⏳ |
 | First dungeon (Divine Beast Cave) | ⏳ |
-| Sound and music (SPU2 and IOP on the PC clock) | ⏳ |
+| Sound and music (SPU2 and IOP on the PC clock) | 🔧 |
 | Native frame loop (no vblank pacing) | ⏳ |
 | Memory card saves | ⏳ |
 | Linux build | ⏳ |
@@ -49,6 +51,14 @@ not used.
 
 [docs/RECOMP_NOTES.md](docs/RECOMP_NOTES.md) records how the port is brought up, every fix and how it was found, and
 what remains open.
+
+## Screenshots
+
+The first boots on the full native path (native GS renderer, native IOP modules, recompiled overlays):
+
+| | | |
+|---|---|---|
+| ![The intro's castle](docs/screenshots/intro-castle.png) | ![The title logo](docs/screenshots/title-logo.png) | ![The opening scene](docs/screenshots/opening-desk.png) |
 
 ## How it works
 
