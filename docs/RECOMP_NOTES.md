@@ -61,3 +61,23 @@ from the ELF's own symbols.
   only accepted slot 0. On the console MCSERV answers for the card in the port whatever the slot when no multitap is
   plugged. Fix (fork, `dc/native`): `ps2_stubs::setMcAnySlot(true)` (or `PS2X_MC_ANY_SLOT=1`), off by default so the
   other ports keep their behaviour; `runtime/dc_overrides.cpp` turns it on.
+
+## Boots 2-6: memory card, sound, title
+
+- Boot 2: with the any-slot libmc mode the card is found in both ports; the 3D intro (castle), the logo and the title
+  screen (the desk and the open book, `TitleLoop` in `TITLE.BIN`) draw right.
+- Every voice transfer of EzMIDI then stalled: `sceSdVoiceTransStatus(ch, WAIT)` (LIBSD export 19, 0x47020) spins on
+  its done flag (0x4A1F4), which LIBSD's DMA handler (0x47674, irq 36/40) sets. A/B with the SPU2 off the wall clock
+  and with the IOP interpreted: the irq is dispatched, but intrman drops it, because `EnableIntr(36)` never ran:
+  LIBSD's `sceSdInit` (export 4, 0x46E28) never runs. SDRDRV calls it when the EE's libsdr asks (`set_spu` ->
+  `sceSdRemoteInit` / `sceSdRemote`), and SDRDRV does register its server (0x80000701), but no RPC ever reached it.
+- Two recompiler behaviours that only an unstripped ELF triggers sent those calls to the runtime's own libsdr HLE:
+  1. every relocated `jal` was bound by symbol name to the runtime handler of that name (`.relmain` kept the
+     relocations);
+  2. every function named after a runtime handler was stubbed by name, whatever the config said.
+  Fix (fork, `dc/native` 350dee4): `[general] native = ["name@0xaddr", ...]` keeps such functions as guest code, and a
+  relocated call binds to a handler only when the config stubs the target. DC lists its libsdr client
+  (`sceSdRemoteInit`, `sceSdTransToIOP`, `sceSdCallBack`, `sceSdRemote`). Boot 5: `sceHSyn_VoisTrans Ok` for each
+  transfer, no IOP call given up (12 before).
+- Boot 6: START once the title shows (`TitleLoop` reads START 0x800, Up/Down, X/START to confirm, Circle), then X:
+  the game goes on to the in-game 3D scenes: a dungeon fight, the Fairy King in the forest, Toan's house.

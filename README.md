@@ -25,8 +25,9 @@ Not an emulator: the game's own MIPS R5900 code, rebuilt as a native program on 
 
 ## Status
 
-**Bring-up, not playable yet.** On the full native path the game boots, finds its memory card, plays its 3D intro
-and shows the title logo and the opening scene. A total recompilation like the other ports of the fork: the game's code, its overlays, its IOP modules
+**Bring-up, not playable yet.** On the full native path the game boots, finds its memory card, plays its 3D intro,
+shows the title screen and, after it, the in-game 3D scenes (dungeon, the Fairy King's forest, Toan's house) with
+music. A total recompilation like the other ports of the fork: the game's code, its overlays, its IOP modules
 and its VU1 microcode all run as native code, drawn by the native GS renderer. Nothing is emulated, and paraLLEl-GS is
 not used.
 
@@ -38,10 +39,10 @@ not used.
 | VU1 microcode compiled ahead of time (`ps2_vu_aot`) | ✅ |
 | Boot: EE kernel, CD reads from the disc files, memory card detected | ✅ |
 | The game's IOP modules recompiled to native code (9 modules, nothing interpreted) | ✅ |
-| Intro, title logo, opening scene (native GS renderer) | ✅ |
+| Intro, title screen, in-game 3D scenes after the title (native GS renderer) | ✅ |
 | New game, Norune village | ⏳ |
 | First dungeon (Divine Beast Cave) | ⏳ |
-| Sound and music (SPU2 and IOP on the PC clock) | 🔧 |
+| Sound and music: SDRDRV, EzMIDI and LIBSD native, voice transfers complete | 🔧 |
 | Native frame loop (no vblank pacing) | ⏳ |
 | Memory card saves | ⏳ |
 | Linux build | ⏳ |
@@ -58,7 +59,9 @@ The first boots on the full native path (native GS renderer, native IOP modules,
 
 | | | |
 |---|---|---|
-| ![The intro's castle](docs/screenshots/intro-castle.png) | ![The title logo](docs/screenshots/title-logo.png) | ![The opening scene](docs/screenshots/opening-desk.png) |
+| ![The intro's castle](docs/screenshots/intro-castle.png) | ![The Dark Genie](docs/screenshots/genie.png) | ![The title logo](docs/screenshots/title-logo.png) |
+| ![The title screen](docs/screenshots/opening-desk.png) | ![In a dungeon](docs/screenshots/dungeon-scene.png) | ![Toan and the Fairy King](docs/screenshots/fairy-king.png) |
+| ![Toan's house](docs/screenshots/toan-house.png) | ![The forest](docs/screenshots/forest-scene.png) | |
 
 ## How it works
 
