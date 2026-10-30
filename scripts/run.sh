@@ -14,4 +14,6 @@ export PS2X_IOP_WALLCLOCK="${PS2X_IOP_WALLCLOCK:-1}"
 # blocking the main thread until its deadline on the PC clock (PS2X_FRAME_CAP, 60). DC_NATIVE=0 goes back to the
 # vblank grid.
 export DC_NATIVE="${DC_NATIVE:-1}"
+# The runtime shows the picture at 4:3, as the PS2's TV did; its default 640x448 window put a black band on each side.
+export PS2X_WINDOW_SIZE="${PS2X_WINDOW_SIZE:-960x720}"
 exec "$BIN" "$ELF" "$@"
