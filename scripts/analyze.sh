@@ -11,4 +11,4 @@ python -I tools/symtab_map.py game/SCUS_971.11 main recomp/maps/dc_main.csv
 sed -i -e '/^ghidra_output = /d' \
        -e 's|^# Path to Ghidra exported function map.*|# Function map from the ELF symbol table (tools/symtab_map.py), in the Ghidra CSV format\nghidra_output = "recomp/maps/dc_main.csv"|' \
        -e 's|^output = .*|output = "generated/"|' "$CONFIG"
-echo "Re-apply the manual stub edits (git diff recomp/dc_scus97111.toml): sceSdRemoteInit, sceSdTransToIOP, sceSdRemote stay native"
+echo "Re-apply the manual edits (git diff recomp/dc_scus97111.toml): the native = [...] list (libsdr client) and the stub comments"

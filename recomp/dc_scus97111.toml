@@ -19,11 +19,20 @@ patch_syscalls = false
 patch_cop0 = true
 patch_cache = true
 
+# Functions recompiled from the game's code although the runtime has a handler of that name: the ELF keeps its
+# symbols, and every function named after a runtime handler would be stubbed by name. libsdr's client side stays the
+# game's, so that SDRDRV.IRX (native) gets its RPCs and runs LIBSD's sceSdInit, which enables the SPU2 DMA interrupt
+# that EzMIDI's voice transfers wait for (boots 2-4: every transfer stalled in sceSdVoiceTransStatus).
+native = [
+  "sceSdRemoteInit@0x00121240",
+  "sceSdTransToIOP@0x00121300",
+  "sceSdCallBack@0x00121370",
+  "sceSdRemote@0x00121380",
+]
+
 # Functions to stub (only names with runtime syscall/stub handlers)
 stubs = [
-  # --- Manual: sceSdRemoteInit (0x121240), sceSdTransToIOP (0x121300) and sceSdRemote (0x121380) are left to the
-  # game's own code, so that SDRDRV.IRX gets its RPC calls as on the console (FightingForOnePiece_Recomp runs SDRDRV
-  # this way, natively).
+  # --- Manual: sceSdRemoteInit, sceSdTransToIOP, sceSdCallBack and sceSdRemote are not stubbed (see `native` above).
   "abs@0x001001C8",
   "_calloc_r@0x00100260",
   "exit@0x00101770",
@@ -399,7 +408,6 @@ stubs = [
   "sceVif1PkReserve@0x00120F78",
   "sceVif1PkAlign@0x00120F90",
   "sceVif1PkAddGsAD@0x00121028",
-  "sceSdCallBack@0x00121370",
   "sceVu0ApplyMatrix@0x00121588",
   "sceVu0MulMatrix@0x001215B8",
   "sceVu0OuterProduct@0x00121600",
