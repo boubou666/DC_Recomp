@@ -32,3 +32,32 @@ How the port is brought up: every step, every fix and how it was found, and what
 the main program only crt0's `_start` (`0x100008`, a NOTYPE label) is added from the uncovered-code pass; the overlays
 need none. ps2_recomp also reads the ELF's own symbols for the main program; it skips the overlay symbols, whose
 sections are empty.
+
+Template arguments put commas in some C++ names (`Alloc64__21CDataAlloc<1,1690000>Fi`); ps2_recomp splits the map
+on every comma, so `tools/symtab_map.py` writes them with `_` instead (5 names). The functions were recompiled anyway,
+from the ELF's own symbols.
+
+## Build
+
+- `scripts/build_tools.sh`, `scripts/analyze.sh`, `scripts/recomp.sh`: 3,948 generated files; `ps2_vu_aot` finds 8 VU
+  microcode fragments (5,312 instruction pairs, 2 also run as VU0 microcode). ps2_recomp warns about unresolved
+  `jr` in some functions (CodeWarrior jump tables, `__sinit_*`), with fallback entries promoted.
+- `scripts/overlays.sh`: `ovl_title` and `ovl_dun`, with their `.init` and `.ctors`.
+- The runner builds in about 3 minutes with 0 errors. paraLLEl-GS is not built in (`PS2X_ENABLE_PARALLEL_GS OFF`).
+- On Windows a shell started without `TMP`/`TEMP` made GCC write to `C:\Windows` (refused, every compile failed):
+  `scripts/common.sh` sets them to `build/tmp` when they are missing.
+
+## Boot 1 (2026-10-30): to the memory card prompt
+
+- First run with the IOP interpreter only to dump the modules (`scripts/iop_recomp.sh`), as the other ports do: the
+  game loads `IOPRP211.IMG` and the nine modules. `tools/iop_recomp.py` recompiles all nine with nothing left to the
+  interpreter (SDRDRV 12 functions, PADMAN 129, SIO2MAN 47, ...).
+- Native boot (native GS, native IOP, wall-clock SPU2 and IOP): `SDR driver version 2.0.0` and `EzMIDI driver version
+  1.2.0` start, the game prints `Memory Card Initialized Successed!!`, and the screen shows "Memory Card (PS2) (8MB)
+  not inserted. To save the game data, at least 400KB is required. Start anyway?" over the blue boot background, drawn
+  right by the native renderer.
+- Why "not inserted": every libmc call of the game passes slot 1 (`CMemoryCardAccess::SearchMcType` 0x213E7C:
+  `sceMcGetInfo(port, 1, ...)`; `LoadSysConfig` 0x214384: `sceMcOpen(port, 1, ...)`), and the runtime's libmc HLE
+  only accepted slot 0. On the console MCSERV answers for the card in the port whatever the slot when no multitap is
+  plugged. Fix (fork, `dc/native`): `ps2_stubs::setMcAnySlot(true)` (or `PS2X_MC_ANY_SLOT=1`), off by default so the
+  other ports keep their behaviour; `runtime/dc_overrides.cpp` turns it on.

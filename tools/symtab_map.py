@@ -92,7 +92,8 @@ def main():
         f.write('Name,Start,End,Size\n')
         for addr in sorted(funcs):
             name, size = funcs[addr]
-            f.write('%s,0x%08X,0x%08X,%d\n' % (name, addr, addr + size, size))
+            # ps2_recomp splits the CSV on every comma: template arguments (CDataAlloc<1,6000>) lose theirs.
+            f.write('%s,0x%08X,0x%08X,%d\n' % (name.replace(',', '_'), addr, addr + size, size))
     print('%s: %d functions (%d from uncovered code) -> %s' % (which, len(funcs), gaps, out))
 
 
