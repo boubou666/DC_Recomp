@@ -24,6 +24,11 @@ patch_cache = true
 # game's, so that SDRDRV.IRX (native) gets its RPCs and runs LIBSD's sceSdInit, which enables the SPU2 DMA interrupt
 # that EzMIDI's voice transfers wait for (boots 2-4: every transfer stalled in sceSdVoiceTransStatus).
 native = [
+  # libgraph's own sceGsSetDefDBuff (it calls sceGsSetDefDispEnv for both display environments, as the binary does at
+  # 0x112C84 and 0x112CA0): the runtime's stub of it wrote DISPLAY with DH = h - 1 and MAGH 0, so in interlaced frame
+  # mode the native back end showed half of DC's 224-line fields (the top 112 lines, doubled) and the picture looked
+  # cut. sceGsSetDefDispEnv's stub encodes DH = 2h - 1 and the 2560-clock MAGH, as libgraph.
+  "sceGsSetDefDBuff@0x00112C08",
   "sceSdRemoteInit@0x00121240",
   "sceSdTransToIOP@0x00121300",
   "sceSdCallBack@0x00121370",
@@ -137,7 +142,6 @@ stubs = [
   "sceGsSetDefDrawEnv@0x00112830",
   "sceGsSetDefClear@0x00112A18",
   "sceGsPutDrawEnv@0x00112B20",
-  "sceGsSetDefDBuff@0x00112C08",
   "sceGsSwapDBuff@0x00112EA0",
   "sceGsSyncV@0x00112F00",
   "sceGsSyncPath@0x00112F98",

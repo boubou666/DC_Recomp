@@ -105,3 +105,18 @@ from the ELF's own symbols.
 - Boot 14: the opening in the Dark Shrine plays: Colonel Flag and his soldiers, the urn, the Dark Genie, with the
   dialogue text; 56-60 fps on the native frame loop. The dark field of boot 8 was the pause (START every 4 s).
 - Open: while a dialogue line shows, the whole screen behind the text window is a striped beige instead of the scene.
+
+## The picture was cut in half (display height)
+
+- Every capture and the window showed only the top half of DC's picture (the logo against the bottom edge, no menu
+  under it). DC sets its double buffer with libgraph's `sceGsSetDefDBuff` (0x112C08), which the runtime stubbed. That
+  stub wrote DISPLAY as DW = w - 1, DH = h - 1, MAGH 0, DX 636, while libgraph's own `sceGsSetDefDBuff` calls
+  `sceGsSetDefDispEnv` for both display environments (0x112C84, 0x112CA0), whose stub encodes the 2560-clock line
+  (MAGH 3) and, in interlaced frame mode (SMODE2 INT+FFMD, DC's 224-line fields), DH = 2h - 1. The GS native present
+  takes DH as frame lines in that mode and showed DH / 2 = 112 of the 224 lines, doubled.
+- Fix (DC only, `recomp/dc_scus97111.toml`): `sceGsSetDefDBuff` in the `native` list, so the game's libgraph runs and
+  calls the `sceGsSetDefDispEnv` stub. DISPLAY is now DW 2560, MAGH 3, DH 448, and the whole picture shows: the title
+  menu (START, CONTINUE, OPTION), the desk narration's subtitles, the full scenes. The stub itself is left as it is
+  (The Third Age stubs it too; reported on f2f).
+- Still open: the window shows the picture with a black band on the left and its right edge cut (presentation
+  offset); the dialogue backdrop (PSMT8 read of a CT32 target).
