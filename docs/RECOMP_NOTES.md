@@ -81,3 +81,15 @@ from the ELF's own symbols.
   transfer, no IOP call given up (12 before).
 - Boot 6: START once the title shows (`TitleLoop` reads START 0x800, Up/Down, X/START to confirm, Circle), then X:
   the game goes on to the in-game 3D scenes: a dungeon fight, the Fairy King in the forest, Toan's house.
+
+## Boots 7-8: attract demo, native frame loop, New game
+
+- Boot 7 (5 min, X every 4 s): the in-game 3D scenes of boot 6 are the attract demo (Toan, Xiao, Goro in their
+  dungeons); the title loops logo -> demo -> logo until START is pressed at the logo.
+- Native frame loop (`runtime/dc_overrides.cpp`, `DC_NATIVE=1`, default in `scripts/run.sh`): `WaitVSync__Fi`
+  (0x12D070), the spin at the end of `MGEndFrame` until the vblank counter (0x2A2400) moves, becomes a wait on the PC
+  clock at the FramePacer cap (`EeScheduler::waitHostDeadline`, as JC2_Recomp); EE time is charged with the real
+  time and the frame is presented at the deadline. Boot 8: 60.0 fps with 59.8-60.2 vblanks/s.
+- Boot 8 (START every 4 s, X 2 s after): the desk title stays from 28 s to 80 s, then New game: "DARK SHRINE" and the
+  field HUD (the compass); START every 4 s then toggles the pause. The 3D field behind the HUD stays nearly black
+  (mean brightness 3 of 255): to look at next.

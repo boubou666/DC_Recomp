@@ -10,4 +10,8 @@ export PS2X_GS_RENDERER="${PS2X_GS_RENDERER:-native}"
 export PS2X_IOP_NATIVE="${PS2X_IOP_NATIVE:-1}"
 export PS2X_SPU2_WALLCLOCK="${PS2X_SPU2_WALLCLOCK:-1}"
 export PS2X_IOP_WALLCLOCK="${PS2X_IOP_WALLCLOCK:-1}"
+# The native frame loop (runtime/dc_overrides.cpp nativeFrameEnd): no vblank paces the game; each frame ends by
+# blocking the main thread until its deadline on the PC clock (PS2X_FRAME_CAP, 60). DC_NATIVE=0 goes back to the
+# vblank grid.
+export DC_NATIVE="${DC_NATIVE:-1}"
 exec "$BIN" "$ELF" "$@"

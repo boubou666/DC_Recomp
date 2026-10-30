@@ -40,10 +40,11 @@ not used.
 | Boot: EE kernel, CD reads from the disc files, memory card detected | ✅ |
 | The game's IOP modules recompiled to native code (9 modules, nothing interpreted) | ✅ |
 | Intro, title screen, in-game 3D scenes after the title (native GS renderer) | ✅ |
-| New game, Norune village | ⏳ |
+| New game: the Dark Shrine | 🔧 |
+| Norune village | ⏳ |
 | First dungeon (Divine Beast Cave) | ⏳ |
 | Sound and music: SDRDRV, EzMIDI and LIBSD native, voice transfers complete | 🔧 |
-| Native frame loop (no vblank pacing) | ⏳ |
+| Native frame loop (no vblank pacing): 60 fps on the PC clock | ✅ |
 | Memory card saves | ⏳ |
 | Linux build | ⏳ |
 | Widescreen, higher internal resolution | ⏳ |
