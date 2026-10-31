@@ -14,6 +14,12 @@
 #include <iostream>
 #include <thread>
 
+namespace dc::native
+{
+    void install(PS2Runtime &runtime);
+    void publish();
+}
+
 namespace
 {
     constexpr uint32_t kDcNtscEntry = 0x00100008u;
@@ -37,6 +43,7 @@ namespace
         (void)rdram;
         const uint32_t ra = getRegU32(ctx, 31);
         g_frames.fetch_add(1u, std::memory_order_relaxed);
+        dc::native::publish();
         static auto s_next = std::chrono::steady_clock::now();
         const uint32_t cap = runtime->framePacer().cap();
         const auto now = std::chrono::steady_clock::now();
@@ -95,6 +102,7 @@ namespace
         // the port whatever the slot; the runtime's libmc only took slot 0, and the game said "Memory Card (PS2)
         // (8MB) not inserted" at boot.
         ps2_stubs::setMcAnySlot(true);
+        dc::native::install(runtime);
 
         const char *native = std::getenv("DC_NATIVE");
         const char *fps = std::getenv("DC_FPS");
