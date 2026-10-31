@@ -39,6 +39,7 @@ namespace dc::native
         {
             uint64_t calls = 0, empty = 0, noData = 0, visuals = 0, strips = 0, triangles = 0, skipped = 0;
             uint64_t shadows = 0, screenSpace = 0; // DrawVu1 calls left to VU1: RenderInfo + 0x320 set, program 0xF
+            uint64_t programs[16] = {};             // DrawVu1 calls by VU1_PROGRAM
         } g_stats;
 
         uint32_t rd32(const uint8_t *rdram, uint32_t address)
@@ -481,6 +482,7 @@ namespace dc::native
             const bool drawn = !shadow && !screenSpace;
             g_stats.shadows += shadow ? 1u : 0u;
             g_stats.screenSpace += screenSpace ? 1u : 0u;
+            ++g_stats.programs[program & 0xFu];
             if (getRegU32(ctx, 2) != 0u)
                 drawVisual(rdram, visual, packet, drawn, lit);
             else
@@ -700,6 +702,11 @@ namespace dc::native
                          static_cast<unsigned long long>(g_unpacks6c.exchange(0)),
                          static_cast<unsigned long long>(g_modelUnpacks.exchange(0)), g_lastTagHigh.load(),
                          g_lastPrmode.load());
+            std::fprintf(stderr, "[dc:native] DrawVu1 by program:");
+            for (int p = 0; p < 16; ++p)
+                if (g_stats.programs[p] != 0u)
+                    std::fprintf(stderr, " %d:%llu", p, static_cast<unsigned long long>(g_stats.programs[p]));
+            std::fprintf(stderr, "\n");
             g_stats = Stats{};
         }
         renderer.endFrame();
