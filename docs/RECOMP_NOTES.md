@@ -222,3 +222,12 @@ from the ELF's own symbols.
   by the record's name, its palette's hash (the palette EnterTexture copies into the record unchanged) and its size;
   no GS layout function runs in the game. Every GS-order texture in the Norune run was found; the Colonel's face is
   right for the first time in the native path.
+- Native shadows (2026-10-31): DC's shadow pass is MGBeginDrawShadow (0x1308A0: the GS drawing into a work texture
+  cleared to black), the shadow-mode draws (RenderInfo + 0x320 set: CVisualShadow's shadow models and models drawn in
+  the pass), whose program (images 69a6 / a750 at 0x1AF8) marks the work texture with RGBA (1, 1, 1, 1) through
+  RenderInfo's shadow matrix (+ 0x2D0) with no depth test, then MGEndDrawShadow (0x130B30, strength in a0) laying the
+  work texture over the frame as CT24 with TEXA AEM (marked texels: alpha = the strength) and ALPHA 0x46, Cd x (1 -
+  As). Natively: begin/end hooked; each shadow-mode draw's MDT triangles noted with clip = RenderInfo 0x230 x 0x10 x
+  0x2D0 x the local-to-world matrix; at the end they are drawn black with alpha = the strength, alpha blend, no depth
+  test. Difference left: where triangles overlap, the game's mask darkens once and this twice (needs a stencil in the
+  renderer). The dancers in the Dark Shrine cast their shadows again.

@@ -54,7 +54,7 @@ namespace dc::native
         struct Stats
         {
             uint64_t calls = 0, noModel = 0, primitives = 0, triangles = 0, shadows = 0, screenSpace = 0;
-            uint64_t ownTextures = 0, noTexture = 0, gsOrderTextures = 0, cloths = 0;
+            uint64_t ownTextures = 0, noTexture = 0, gsOrderTextures = 0, cloths = 0, shadowTriangles = 0;
         } g_stats;
         std::atomic<uint64_t> g_gateSkipped{0};
 
@@ -703,6 +703,8 @@ namespace dc::native
             }
         }
 
+        void noteShadow(const uint8_t *rdram, uint32_t mdt, const Matrix &localToWorld, uint32_t renderInfo, bool listsOnly);
+
         void drawVu1Hook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
         {
             const uint32_t visual = getRegU32(ctx, 4), localToWorld = getRegU32(ctx, 6);
@@ -729,6 +731,8 @@ namespace dc::native
             }
             g_objectState = state;
             drawModel(rdram, mdt, load(rdram, localToWorld), renderInfo, !shadow && !screenSpace);
+            if (shadow)
+                noteShadow(rdram, mdt, load(rdram, localToWorld), renderInfo, false); // a model drawn in the shadow pass
             g_objectState.valid = false;
         }
 
@@ -799,12 +803,110 @@ namespace dc::native
         // MDT positions through RenderInfo's shadow matrix at + 0x2D0, drawn with the shadow program's colour) is not
         // drawn yet.
         constexpr uint32_t kShadowDrawVu1 = 0x00136290u;
-        void shadowDrawHook(uint8_t *, R5900Context *ctx, PS2Runtime *)
+
+        // Shadows. DC draws them in a pass: MGBeginDrawShadow (0x1308A0) points the GS at a work texture cleared to
+        // black; every draw with RenderInfo + 0x320 set projects its geometry through RenderInfo's shadow matrix
+        // (+ 0x2D0: clip = RenderInfo 0x230 x 0x10 x 0x2D0 x the local-to-world matrix) and marks the work texture with
+        // the shadow program's constant colour (images 69a6 / a750 at 0x1AF8: FTOI0 of 1.0, RGBA 1, 1, 1, 1), no depth
+        // test; MGEndDrawShadow (0x130B30, its argument the strength) draws the work texture over the frame read as CT24
+        // with TEXA's AEM (black: alpha 0, marked: alpha = the strength) and ALPHA 0x46, Cd x (1 - As). Here each
+        // shadow draw's triangles are kept, and the pass's end draws them black with alpha = the strength and an alpha
+        // blend (the same Cd x (1 - As)), no depth test. Unlike the work texture, triangles that overlap darken twice.
+        struct ShadowDraw
         {
+            Matrix toScreen;
+            std::vector<ps2x::native::Vertex> vertices;
+        };
+        std::vector<ShadowDraw> g_shadowDraws;
+        PS2Runtime::RecompiledFunction g_beginShadow = nullptr, g_endShadow = nullptr;
+
+        // A shadow-mode draw: the MDT's triangles (CreateVUdataShadow's reading: each primitive's index tuples taken
+        // three by three as triangles; a strip's when the primitive is one), positions only.
+        void noteShadow(const uint8_t *rdram, uint32_t mdt, const Matrix &localToWorld, uint32_t renderInfo, bool listsOnly)
+        {
+            ShadowDraw draw;
+            const Matrix clip = mul(mul(mul(load(rdram, renderInfo + 0x230u), load(rdram, renderInfo + 0x10u)),
+                                        load(rdram, renderInfo + 0x2D0u)),
+                                    localToWorld);
+            draw.toScreen = mul(load(rdram, renderInfo + 0x270u), clip);
+            const uint32_t positions = mdt + rd32(rdram, mdt + 0x10u);
+            const uint32_t stride = static_cast<int32_t>(rd32(rdram, mdt + 0x20u)) > 0 ? 4u : 3u;
+            const uint32_t list = mdt + rd32(rdram, mdt + 0x28u);
+            const uint32_t primitives = rd32(rdram, list + 8u);
+            auto vertex = [&](uint32_t indices, uint32_t i) {
+                const uint32_t pi = rd32(rdram, indices + i * stride * 4u);
+                ps2x::native::Vertex v;
+                v.x = rdf(rdram, positions + pi * 16u);
+                v.y = rdf(rdram, positions + pi * 16u + 4u);
+                v.z = rdf(rdram, positions + pi * 16u + 8u);
+                return v;
+            };
+            uint32_t at = list + 0x10u;
+            for (uint32_t p = 0; p < primitives && p < 4096u; ++p)
+            {
+                const uint32_t type = rd32(rdram, at), count = rd32(rdram, at + 4u);
+                const uint32_t indices = at + 12u;
+                at = indices + count * stride * 4u;
+                if (count > 65536u)
+                    break;
+                if (type == 4u && !listsOnly)
+                    for (uint32_t i = 2; i < count; ++i)
+                    {
+                        ps2x::native::Vertex a = vertex(indices, i - 2), b = vertex(indices, i - 1);
+                        if (i & 1u)
+                            std::swap(a, b);
+                        draw.vertices.push_back(a);
+                        draw.vertices.push_back(b);
+                        draw.vertices.push_back(vertex(indices, i));
+                    }
+                else
+                    for (uint32_t i = 0; i + 2 < count; i += 3)
+                        for (uint32_t k = 0; k < 3; ++k)
+                            draw.vertices.push_back(vertex(indices, i + k));
+            }
+            clipDepth(clip, draw.vertices);
+            if (!draw.vertices.empty())
+                g_shadowDraws.push_back(std::move(draw));
+        }
+
+        // CVisualShadow::DrawVu1, taken over: no VU data, packet or VU1 program; its shadow model (the MDT at + 0x20)
+        // noted for the pass.
+        void shadowDrawHook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *)
+        {
+            const uint32_t visual = getRegU32(ctx, 4), localToWorld = getRegU32(ctx, 6), renderInfo = getRegU32(ctx, 7);
             g_objectState.valid = false;
             ++g_stats.shadows;
             setReturnS32(ctx, 0);
             ctx->pc = getRegU32(ctx, 31);
+            const uint32_t mdt = rd32(rdram, visual + 0x20u);
+            if (mdt != 0u)
+                noteShadow(rdram, mdt, load(rdram, localToWorld), renderInfo, true);
+        }
+
+        void beginShadowHook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+        {
+            g_shadowDraws.clear();
+            g_beginShadow(rdram, ctx, runtime);
+        }
+
+        void endShadowHook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+        {
+            const uint32_t strength = getRegU32(ctx, 4) & 0xFFu;
+            g_endShadow(rdram, ctx, runtime);
+            ps2x::native::Material material;
+            material.textured = false;
+            material.blend = ps2x::native::Material::Blend::Alpha;
+            material.depthTest = false;
+            material.depthWrite = false;
+            for (ShadowDraw &draw : g_shadowDraws)
+            {
+                for (ps2x::native::Vertex &v : draw.vertices)
+                    v.rgba = strength << 24; // black, alpha = the strength (0x80 = 1.0)
+                g_stats.shadowTriangles += draw.vertices.size() / 3u;
+                ps2x::native::Renderer::instance().draw(material, draw.toScreen.m, draw.vertices.data(),
+                                                        static_cast<uint32_t>(draw.vertices.size()));
+            }
+            g_shadowDraws.clear();
         }
 
         // DC_PROBE_TEX=1 (diagnosis): DC's 2D sprite functions (packet, CTexture *, const CRect &dst, ...): each
@@ -922,6 +1024,11 @@ namespace dc::native
         runtime.registerFunction(kSetGsReg3, &setGsReg3Hook);
         runtime.registerFunction(kClothDrawVu1, &clothDrawHook);
         runtime.registerFunction(kShadowDrawVu1, &shadowDrawHook);
+        if ((g_beginShadow = runtime.lookupFunction(0x001308A0u)) && (g_endShadow = runtime.lookupFunction(0x00130B30u)))
+        {
+            runtime.registerFunction(0x001308A0u, &beginShadowHook);
+            runtime.registerFunction(0x00130B30u, &endShadowHook);
+        }
         ps2x::native::Renderer &renderer = ps2x::native::Renderer::instance();
         renderer.setEnabled(true);
         renderer.beginFrame(screen());
@@ -943,7 +1050,7 @@ namespace dc::native
         {
             std::fprintf(stderr, "[dc:native] per 300 frames: %llu DrawVu1 calls (%llu without a known MDT), %llu primitives, "
                                  "%llu triangles, %llu own textures, %llu untextured for lack of one; not drawn: %llu shadows, "
-                                 "%llu screen-space; %llu cloths; %llu GS-order textures (offline conversion pending); VU1 programs skipped: %llu\n",
+                                 "%llu screen-space; %llu cloths; %llu shadow triangles; %llu GS-order textures not in the store; VU1 programs skipped: %llu\n",
                          static_cast<unsigned long long>(g_stats.calls), static_cast<unsigned long long>(g_stats.noModel),
                          static_cast<unsigned long long>(g_stats.primitives),
                          static_cast<unsigned long long>(g_stats.triangles),
@@ -952,6 +1059,7 @@ namespace dc::native
                          static_cast<unsigned long long>(g_stats.shadows),
                          static_cast<unsigned long long>(g_stats.screenSpace),
                          static_cast<unsigned long long>(g_stats.cloths),
+                         static_cast<unsigned long long>(g_stats.shadowTriangles),
                          static_cast<unsigned long long>(g_stats.gsOrderTextures),
                          static_cast<unsigned long long>(g_gateSkipped.exchange(0)));
             std::fprintf(stderr, "[dc:native] groups: %llu numbered here; skipped at pc 0: %llu, pc 8: %llu, other: %llu (last 0x%llx)\n",
