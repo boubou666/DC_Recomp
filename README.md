@@ -65,6 +65,21 @@ scenes.
 | Linux build | ⏳ |
 | Widescreen, higher internal resolution | ⏳ |
 
+**Native port** (no PS2 hardware emulation left, not even a small part: the shared goal of the fork's ports). Native
+means the game's draws built straight from its own data (vertices, matrices, materials), with no GIF packet, no GS
+state machine and no copy of GS memory in between.
+
+| Layer | |
+|---|:---:|
+| IOP modules (9) recompiled to C++, none interpreted | ✅ |
+| Sound on the PC's clock | ✅ |
+| No paraLLEl-GS: OpenGL on the GPU | ✅ |
+| Frame loop on the PC's clock (60 fps, no vblank pacing) | ✅ |
+| 3D models drawn natively from the game's data, lit like VU1 (`DC_NATIVE3D=1`) | 🔧 |
+| Every VU1 program translated (screen-space sprites, particles and other effects still on the VU1 AOT interpreter) | ⏳ |
+| Menus, HUD, text and 2D drawn natively, no GS packets interpreted | ⏳ |
+| DMA, VIF / GIF packets and the IPU handled natively, not by the runtime's hardware layer | ⏳ |
+
 ✅ works · 🔧 in progress · ⏳ not reached yet
 
 [docs/RECOMP_NOTES.md](docs/RECOMP_NOTES.md) records how the port is brought up, every fix and how it was found, and
