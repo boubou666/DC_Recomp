@@ -231,3 +231,75 @@ from the ELF's own symbols.
   0x2D0 x the local-to-world matrix; at the end they are drawn black with alpha = the strength, alpha blend, no depth
   test. Difference left: where triangles overlap, the game's mask darkens once and this twice (needs a stencil in the
   renderer). The dancers in the Dark Shrine cast their shadows again.
+- Model data kept (2026-10-31): for most static pieces (the town's map parts) DC reuses the MDT's memory once it has
+  built the visual's VU data from it, so a draw that reads the MDT then reads other data. That garbage drew stray
+  triangles. It also gave a wrong primitive count, so groups lost step with the VU1 programs skipped (black
+  gameplay). CreateVUdataFromMDT (0x135AA0) and its Remake (0x135E50) are hooked: the MDT ("MDT\0", size at + 8) is
+  copied as the game builds from it, keyed by the VU data. A draw reads the live MDT while it is still there
+  (animated models keep theirs at + 0x20), the copy otherwise. In Norune, the groups numbered now equal the programs
+  skipped (91,500 per 300 frames).
+- Water (2026-10-31): CWater (Norune's river; CreateVUData 0x1607E0, DrawVu1 0x160F20) is taken over: no VU data.
+  Its height field (rows at + 0, columns at + 4, heights at + 8, corners at + 0x20 / + 0x30 / + 0x40, height scale
+  + 0x9C) is drawn natively as strips in the water colour (+ 0x90), alpha blended, no Z write. The game's refraction
+  (a copy of the frame drawn through the water) is not drawn yet.
+- Depth of field natively (2026-10-31): the town (EdDrawDOF), the dungeons and the cutscenes call DepthOfField
+  (0x1652C0). It stretches the 640 x 224 frame to half its width (and that to half again) in a work texture through
+  the GS, then draws that texture back in strips, Z test GEQUAL at the focus depths. The GS copy has none of the
+  native 3D, so the strips would lay its stale pages over everything behind the focus. It is not what spoils
+  Norune (64 x 32 blocks of stale GS pages over the town): those stay with DepthOfField skipped
+  (`DC_NO_DOF=1`). DepthOfField is taken over. The renderer gets
+  Material::fromFrame: a texture that is the frame as drawn so far, copied at the draw's group with the width halved
+  1 or 2 times by bilinear blits, as the game stretches it. The adapter draws the game's strips as they are (8 x 41
+  then 14 x 21, depths from its table 0x266930 through the matrix at 0x1C75570, the haze's random walk at 0x1D18A00)
+  sampling that copy. `DC_NO_DOF=1` still skips it for diagnosis.
+- Back faces (2026-10-31): the models' program (f256...) culls. Its flag word at VU 0 is DrawVu1's qword (x the
+  program x 2, y RenderInfo + 0x33C, z RenderInfo + 0x310). With z bit 2 set, its list loop (0x1300), strip loop
+  (0x1510, the winding taken back every vertex) and clipper (0x2368) all take the screen-space (v2 - v0) x (v1 - v0).
+  A negative z sets ADC on the triangle's last vertex. The adapter drew every face: characters drawn without Z write
+  (ZBUF ZMSK) showed their insides over their fronts (Seth's cape, Flag's head in the Dark Shrine). The same test now
+  runs in submit for models with the flag (`DC_NO_CULL=1` turns it off for diagnosis).
+- Texture binding (2026-10-31): CreateVUdataFromMDT binds each primitive's texture once, when it builds the VU data.
+  GetTextureHandle -> SearchTextureName gives the newest record of the material's name; a missing name gives handle
+  -1, which GetTexture takes as record 0. The record's TEX0 goes into the VU data, and Remake keeps it. The adapter
+  looked the name up at draw time, so a later model with a texture of the same name took over: the Colonel's face
+  was blank and the Genie's belly plain once both were loaded. The create hook now notes the record per primitive
+  (with the MDT copy, keyed by the VU data), the same way and at the same moment; draws use it.
+- Shadow pass on the GS side: dropped (2026-10-31). MGBeginDrawShadow / MGEndDrawShadow are taken over entirely
+  (the shadows are native). Their GS work cleared 432 x 432 of the work texture (fbp 210, where Norune's water also
+  copies the frame) and laid all 640 x 224 of it over the frame. No program marks it any more, so the stale rest
+  blacked out Norune, with page-sized pieces of old frames left (`PS2X_GS_NATIVE_TARGETLOG` showed target 210
+  reloaded from GS memory every frame).
+- Vertex colours and fog (2026-10-31): two parts of the model program the adapter skipped, which changed every
+  scene's look against the VU1 reference run. (1) Colour streams: an MDT with + 0x20 has a fourth index per tuple.
+  SetVuData copies that colour (four floats) into the VU data and sets 0x100 in the primitive header. The program's
+  lighting at 0xBF8 multiplies the lit colour by it per component before the clamp (0xAD0 is the same without it).
+  Map pieces are prelit this way. (2) Fog: DrawVu1 sets PRMODE FGE when RenderInfo + 0x324 is set (outside the
+  shadow pass) and FOGCOL from + 0x338. It puts (+ 0x328, + 0x334, + 0x330, + 0x32C) at VU 22; the program gives
+  each vertex F = max(min(VU22.x + VU22.w / w, VU22.y), VU22.z). Both are now in drawModel (Vertex::fog = F / 255,
+  Material::fog with that colour). `DC_LOG_VCOLOUR=1` logs the first colours read.
+- Near geometry and runaway vertices (2026-10-31). (1) Z: the models' GIF tag writes ST, RGBAQ, XYZF2 (REGS 0x412)
+  PACKED, where the GS takes Z from bits 4..27 of the FTOI4 word: Z is z / w itself, 24 bits. The adapter used 16 x
+  z / w (an XYZ2's Z). Near geometry went past 2^24 and wrapped to the far end: models behind drawn in front, and
+  triangles near the camera missing. A clamp tried in between flattened near characters (inside-out faces). The
+  scale is now 1 and the renderer's 24-bit wrap stays, as XYZF2 itself does.
+  (2) The guard band: without RenderInfo + 0x310 bit 1, the program does not clip. Its loops keep a triangle only if
+  every vertex's screen x / w, y / w and w lie strictly inside VU 20 / 21 (RenderInfo + 0x210 / + 0x220: FMAND of the
+  signs of VU21 - v and v - VU20, mask 0xD0). In Norune those are x, y in (0, 4095.9) and w in (6, 65535). Otherwise
+  ADC drops it whole. The adapter now does the same (`DC_NO_GUARD=1` turns it off). Cloth grids hold runaway
+  vertices (about 1e37) that the PS2 never shows for that reason; they were the streaks across Norune.
+- IM2 archives (2026-10-31): 2,546 of DC's texture directories use "IM2\0" instead of "IMG\0", with the same layout
+  (the map pieces' textures, s140101...). `tools/dc_texconv.py` reads both: 3,615 distinct 8-bit textures (was 921).
+  A store miss falls back to the converted indices of that name and size, coloured with the record's current
+  palette (plain CT32 in main memory), and every miss is logged once.
+- IM2 means pre-swizzled (2026-10-31): EnterIMGFile (0x132BA0) compares the archive's magic with "IM2" and passes the
+  result to EnterTexture as its last argument; with it set, EnterTexture copies the 8-bit texels unchanged instead of
+  running Conv8to32, i.e. IM2 pictures are already in GS memory order on the disc. The converter took them as linear
+  (the intro's book, the "Norune Village" title and the map pieces' textures came out scrambled). They are now
+  resolved offline (`tools/gs_layout.py`): the data laid out as the PSMCT32 image of half the width and height the
+  game uploads, read back as PSMT8. No GS layout function runs in the game.
+- No GS (2026-10-31): `PS2X_GS_RENDERER=none` is DC's default (scripts/run.sh). The native renderer's present()
+  draws the frame in the game's call order. The 2D routines are taken over one by one from their own arguments and
+  the game's records: clears, fills, the set2DSprite family, the message windows' glyphs (set2DSprite_Core) and
+  text colour (SetClut), sprite tables, the effects' 3D sprites, texture animation (MGMoveImage / MoveImageTest
+  applied to the decoded textures), the balloons (drawn into an offscreen target), DoF (a copy of the frame).
+  present() now honours Material::depthTest (the 2D was depth-tested against the 3D and hidden).

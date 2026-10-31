@@ -2,11 +2,14 @@
 """Offline conversion of Dark Cloud's 8-bit textures into a native store, from the user's own disc files.
 
 DC enters its textures from IMG archives (CTextureManager::EnterIMGFile, 0x132BA0): "IMG\\0", a count, then 0x30-byte
-entries (name, + 0x20 the offset of a TIM2 picture). EnterTexture (0x1313B0) keeps 8-bit pictures in GS memory order
+entries (name, + 0x20 the offset of a TIM2 picture). Twice as many sit in the same directory under "IM2\\0" (the map
+pieces' textures among them). EnterTexture (0x1313B0) keeps 8-bit pictures in GS memory order
 (Conv8to32: the game sends them as a CT32 image of half the width), so the native adapter does not decode those at
 runtime (BaldHuman's rule: no GS layout function in the game; texels in GS order only through an offline conversion).
-This tool reads the same pictures from the disc, where they are plain (TIM2: linear 8-bit indices, a 256-colour CT32
-palette), and writes them to a store the adapter loads at startup, keyed by the record's name, size and palette.
+This tool reads the same pictures from the disc (TIM2: 8-bit indices, a 256-colour CT32 palette): plain in IMG
+archives; in GS memory order in IM2 ones (EnterIMGFile tells EnterTexture they are already converted, and it copies
+them unchanged), which tools/gs_layout.py resolves here, offline. It writes them to a store the adapter loads at
+startup, keyed by the record's name, size and palette.
 
   tools/dc_texconv.py <game dir with DATA.HD2 / DATA.DAT> <output file, e.g. build/textures/dc_textures.bin>
 
@@ -17,6 +20,8 @@ Generated from the user's disc: never committed.
 """
 import struct
 import sys
+
+from gs_layout import untwiddle8
 
 
 def fnv1a32(data):
@@ -31,14 +36,23 @@ def csm1(index):
     return (index & 0xE7) | ((index & 0x08) << 1) | ((index & 0x10) >> 1)
 
 
+def archives(blob):
+    """Offsets of the "IMG\0" and "IM2\0" magics in a file."""
+    for magic in (b'IMG\x00', b'IM2\x00'):
+        pos = 0
+        while True:
+            k = blob.find(magic, pos)
+            if k < 0:
+                break
+            pos = k + 4
+            yield k
+
+
 def pictures(blob):
-    """Each (name, TIM2 picture offset) of every IMG archive in a file (standalone or embedded)."""
-    pos = 0
-    while True:
-        k = blob.find(b'IMG\x00', pos)
-        if k < 0:
-            return
-        pos = k + 4
+    """Each (name, TIM2 picture offset) of every IMG / IM2 archive in a file (standalone or embedded).
+
+    IM2 ("IM2\0") is the same directory under another magic; the map pieces' textures (s140101...) are kept in them."""
+    for k in sorted(archives(blob)):
         if k % 16 or k + 0x10 > len(blob):
             continue
         count = struct.unpack_from('<I', blob, k + 4)[0]
@@ -49,7 +63,7 @@ def pictures(blob):
             name = blob[entry:entry + 0x20].split(b'\x00')[0]
             picture = k + struct.unpack_from('<I', blob, entry + 0x20)[0]
             if name and picture + 0x30 <= len(blob) and blob[picture:picture + 4] == b'TIM2':
-                yield name, picture
+                yield name, picture, blob[k:k + 4] == b'IM2\x00'
 
 
 def convert(blob, picture):
@@ -89,11 +103,15 @@ def main():
                 continue
             dat.seek(offset)
             blob = dat.read(size)
-            for name, picture in pictures(blob):
+            for name, picture, twiddled in pictures(blob):
                 texture = convert(blob, picture)
                 if not texture:
                     continue
                 width, height, palette_hash, palette, indices = texture
+                if twiddled:
+                    # IM2: the texels are in GS memory order on the disc (EnterIMGFile passes EnterTexture its "already
+                    # converted" flag for that magic, and EnterTexture copies them instead of running Conv8to32).
+                    indices = untwiddle8(indices, width, height)
                 key = (name, width, height, palette_hash, fnv1a32(indices[:4096]))
                 if key in seen:
                     continue
