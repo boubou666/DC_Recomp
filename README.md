@@ -41,8 +41,8 @@ draws it with the PC GPU, lit as the game's VU1 program lights it, and VU1 skips
 | Menus, HUD, text, 2D, the cutscenes' depth of field, everything sent to the GS as packets | the fork's GS front end interprets the GS packets (registers, GS memory layout) and draws them with OpenGL |
 | DMA, VIF / GIF packet handling, EE kernel HLE, IPU | the runtime's hardware layer |
 
-Known defects: the cutscenes' depth of field shows colour stripes behind the dialogue (the GS front end's copy of the
-frame, under investigation), black blocks in some Norune scenes.
+Known defects: some character textures come out white or missing in the native 3D, black blocks in some Norune
+scenes.
 
 | Milestone | |
 |---|:---:|
@@ -80,7 +80,7 @@ The first boots on the full native path (native GS renderer, native IOP modules,
 | ![Toan's house](docs/screenshots/toan-house.png) | ![The forest](docs/screenshots/forest-scene.png) | ![New game: the name entry](docs/screenshots/register-name.png) |
 | ![The Dark Shrine](docs/screenshots/shrine-soldiers.png) | ![Colonel Flag](docs/screenshots/colonel-flag.png) | ![The urn](docs/screenshots/shrine-urn.png) |
 | ![Opening dialogue](docs/screenshots/opening-dialogue.png) | ![The Dark Genie rises](docs/screenshots/genie-rises.png) | ![Norune at night](docs/screenshots/norune-night.png) |
-| ![Toan at home](docs/screenshots/norune-house.png) | ![Norune's festival](docs/screenshots/norune-festival.png) | |
+| ![Toan at home](docs/screenshots/norune-house.png) | ![Norune's festival](docs/screenshots/norune-festival.png) | ![A cutscene dialogue](docs/screenshots/cutscene-balloon.png) |
 
 ## How it works
 

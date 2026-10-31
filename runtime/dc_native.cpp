@@ -490,6 +490,88 @@ namespace dc::native
             g_moveImage(rdram, ctx, runtime);
         }
 
+        // DC_PROBE_TEX=1: DC's 2D sprite functions (packet, CTexture *, const CRect &dst, ...): each (caller, texture)
+        // that covers most of the screen (dst at least 512 wide), once.
+        struct SpriteHook
+        {
+            uint32_t address;
+            PS2Runtime::RecompiledFunction original;
+        };
+        SpriteHook g_spriteHooks[] = {{0x0014C3C0u, nullptr}, {0x0014CD80u, nullptr}, {0x0015BD00u, nullptr},
+                                      {0x0015C000u, nullptr}, {0x0015C310u, nullptr}, {0x0015C630u, nullptr},
+                                      {0x0015C980u, nullptr}, {0x0015E540u, nullptr}, {0x0015EAD0u, nullptr}};
+        void spriteProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+        {
+            const uint32_t pc = ctx->pc;
+            PS2Runtime::RecompiledFunction original = nullptr;
+            for (const SpriteHook &hook : g_spriteHooks)
+                if (hook.address == pc)
+                    original = hook.original;
+            static std::atomic<bool> s_first{true};
+            if (s_first.exchange(false))
+                std::fprintf(stderr, "[dc:probe] sprite hooks called (first 0x%06x)\n", pc);
+            const uint32_t texture = getRegU32(ctx, 5), rect = getRegU32(ctx, 6);
+            const int32_t width = static_cast<int32_t>(rd32(rdram, rect + 8u));
+            if (texture != 0u && width >= 512)
+            {
+                static std::mutex s_mutex;
+                static std::vector<uint64_t> s_seen;
+                const uint64_t tex0 = rd64(rdram, texture + 0x28u);
+                const uint64_t key = static_cast<uint64_t>(getRegU32(ctx, 31)) << 32 ^ tex0;
+                std::lock_guard<std::mutex> lock(s_mutex);
+                if (std::find(s_seen.begin(), s_seen.end(), key) == s_seen.end() && s_seen.size() < 64u)
+                {
+                    s_seen.push_back(key);
+                    std::fprintf(stderr, "[dc:probe] sprite 0x%06x from ra 0x%08x: tbp %u tbw %u psm 0x%x cbp %u, dst %d,%d %dx%d\n",
+                                 pc, getRegU32(ctx, 31), static_cast<uint32_t>(tex0 & 0x3FFFu),
+                                 static_cast<uint32_t>(tex0 >> 14) & 0x3Fu, static_cast<uint32_t>(tex0 >> 20) & 0x3Fu,
+                                 static_cast<uint32_t>(tex0 >> 37) & 0x3FFFu, static_cast<int>(rd32(rdram, rect)),
+                                 static_cast<int>(rd32(rdram, rect + 4u)), width, static_cast<int>(rd32(rdram, rect + 12u)));
+                }
+            }
+            // DC_SKIP_TBP=<block>: sprites of that texture are not drawn (diagnosis).
+            static const uint32_t s_skip = [] { const char *v = std::getenv("DC_SKIP_TBP"); return v ? static_cast<uint32_t>(std::atoi(v)) : ~0u; }();
+            if (texture != 0u && (rd64(rdram, texture + 0x28u) & 0x3FFFu) == s_skip)
+            {
+                ctx->pc = getRegU32(ctx, 31);
+                return;
+            }
+            if (original)
+                original(rdram, ctx, runtime);
+        }
+
+        // DC_PROBE_TEX=1: ClsMes::MakeFukidashi_sub (0x150F50): the balloon's fields (+0x38 type, +0x3C..+0x50 window
+        // corners and size, +0x58 tail flag, +0x78 / +0x80 / +0x88 tail points, +0x90 opening), every 120th call.
+        PS2Runtime::RecompiledFunction g_fukidashiSub = nullptr;
+        void fukidashiProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+        {
+            static std::atomic<uint32_t> s_calls{0};
+            if (s_calls.fetch_add(1u) % 120u == 0u)
+            {
+                const uint32_t mes = getRegU32(ctx, 4);
+                std::fprintf(stderr, "[dc:probe] fukidashi:");
+                for (uint32_t off = 0x38u; off <= 0x8Cu; off += 4u)
+                    std::fprintf(stderr, " %02x=%d", off, static_cast<int32_t>(rd32(rdram, mes + off)));
+                std::fprintf(stderr, " 90=%.3f\n", rdf(rdram, mes + 0x90u));
+            }
+            g_fukidashiSub(rdram, ctx, runtime);
+        }
+
+        // DC_PROBE_TEX=1: RollPos(float angle, float *centre, float *point, float *out) (0x14C690), its first calls.
+        PS2Runtime::RecompiledFunction g_rollPos = nullptr;
+        void rollPosProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+        {
+            static std::atomic<uint32_t> s_logged{0};
+            const uint32_t centre = getRegU32(ctx, 4), point = getRegU32(ctx, 5), out = getRegU32(ctx, 6);
+            const float angle = ctx->f[12];
+            const float cx = rdf(rdram, centre), cy = rdf(rdram, centre + 4u), px = rdf(rdram, point),
+                        py = rdf(rdram, point + 4u);
+            g_rollPos(rdram, ctx, runtime);
+            if (s_logged.fetch_add(1u) < 24u)
+                std::fprintf(stderr, "[dc:probe] RollPos angle %.4f centre %.1f,%.1f point %.1f,%.1f -> %.1f,%.1f\n", angle,
+                             cx, cy, px, py, rdf(rdram, out), rdf(rdram, out + 4u));
+        }
+
         bool g_enabled = false;
     }
 
@@ -511,6 +593,13 @@ namespace dc::native
                 runtime.registerFunction(kPkAddGsAD, &addGsADProbe);
             if ((g_moveImage = runtime.lookupFunction(0x0012F210u)))
                 runtime.registerFunction(0x0012F210u, &moveImageProbe);
+            if ((g_rollPos = runtime.lookupFunction(0x0014C690u)))
+                runtime.registerFunction(0x0014C690u, &rollPosProbe);
+            if ((g_fukidashiSub = runtime.lookupFunction(0x00150F50u)))
+                runtime.registerFunction(0x00150F50u, &fukidashiProbe);
+            for (SpriteHook &hook : g_spriteHooks)
+                if ((hook.original = runtime.lookupFunction(hook.address)))
+                    runtime.registerFunction(hook.address, &spriteProbe);
         }
         const char *on = std::getenv("DC_NATIVE3D");
         if (!(on && on[0] == '1'))

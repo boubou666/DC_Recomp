@@ -29,6 +29,18 @@ native = [
   # mode the native back end showed half of DC's 224-line fields (the top 112 lines, doubled) and the picture looked
   # cut. sceGsSetDefDispEnv's stub encodes DH = 2h - 1 and the 2560-clock MAGH, as libgraph.
   "sceGsSetDefDBuff@0x00112C08",
+  # DC's libm, double precision (soft-float: arguments in a0 / a1, result in v0, 64-bit): the runtime's handlers for
+  # these names take floats in f12 / f14 and return f0, so atan2 handed back its own argument (the speech balloon's
+  # tail angle, then the balloon drawn off its texture: stripes over every cutscene dialogue). The game's code runs.
+  "atan@0x0011CBC0",
+  "cos@0x0011CFD0",
+  "fabs@0x0011D0D8",
+  "floor@0x0011D110",
+  "sin@0x0011D310",
+  "atan2@0x0011DA18",
+  "sqrt@0x0011DB30",
+  "__kernel_cosf@0x0011BD78",
+  "__kernel_sinf@0x0011C820",
   "sceSdRemoteInit@0x00121240",
   "sceSdTransToIOP@0x00121300",
   "sceSdCallBack@0x00121370",
@@ -327,15 +339,6 @@ stubs = [
   "sceSifSyncIop@0x00119510",
   "sceSifRebootIop@0x00119558",
   "__ieee754_rem_pio2f@0x0011A8D0",
-  "__kernel_cosf@0x0011BD78",
-  "__kernel_sinf@0x0011C820",
-  "atan@0x0011CBC0",
-  "cos@0x0011CFD0",
-  "fabs@0x0011D0D8",
-  "floor@0x0011D110",
-  "sin@0x0011D310",
-  "atan2@0x0011DA18",
-  "sqrt@0x0011DB30",
   "sceMcInit@0x0011DF80",
   "sceMcChangeThreadPriority@0x0011E100",
   "sceMcGetSlotMax@0x0011E190",

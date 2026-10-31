@@ -144,17 +144,19 @@ from the ELF's own symbols.
   was asked about was drawn natively (`gate: N MSCALs ... N drawn here`), and no DrawVu1 call was left to VU1 (0
   shadows, 0 program-0xF). VU1 runs no microcode in those scenes; shadows (RenderInfo + 0x320) and the screen-space
   program will need translating once a scene uses them.
-- The stripes over the cutscene dialogues (whole screen, and inside the message box) are **not** the GS back end:
-  the CPU GS reference (`PS2X_GS_RENDERER=cpu`, `DC_NATIVE3D=0`) shows the same stripes and white frames. Ruled out
-  so far:
-  - DepthOfField (0x1652C0, the cutscene blur, `DC_NO_DOF=1` skips it): stripes unchanged.
-  - The speech balloon render target: `fukidashibase` is CT32 at fbp 227 (`DC_PROBE_TEX=1` lists the texture
-    manager), no PSMT8 target is drawn.
-  - The cutscene frame capture (EdSaveFrameImageTask -> MGMoveFrameBuffImage -> MGMoveImage, 448 one-line GS copies):
-    MGMoveImage is never called before the stripes appear.
-  - The message text work area (block 6720, fbp 210) is shared with DoF's `work` texture and `frame_image(_mes)`; the
-    text code copies PSMT8 glyph rows there (local-to-local, 128x40). A full-screen draw of a texture over that area
-    would show glyph bytes as colour: next suspect. To find: the draw that covers the screen during a message (its
-    TEX0 and the code that sends it).
+- The stripes over the cutscene dialogues (whole screen, and inside the message box) were not the GS: the CPU GS
+  reference showed them too. The speech balloon (`ClsMes::MakeFukidashi`) is drawn into the `fukidashibase` texture
+  (CT32, fbp 227), then that texture is drawn over the screen. The balloon's tail points (ClsMes + 0x74..0x80, from
+  `RollPos` with the angle `atan2(speaker - centre)`) came out at -830..1514, so the balloon landed at y ~935 in its
+  target, outside the scissor, and the screen got the texture's old contents (glyph rows) with full alpha.
+  `atan2` returned its own argument: DC's libm is the double-precision one (soft-float, CodeWarrior: arguments in
+  a0 / a1 and the result in v0, 64-bit; separate `sinf` / `atan2f` exist), and the recompiler mapped `sin`, `cos`,
+  `atan`, `atan2`, `sqrt`, `floor`, `fabs` to the runtime's handlers, which take floats in f12 / f14 and return f0.
+  Removing them from `stubs` is not enough (the recompiler maps known names by itself): they are in the config's
+  `native` list now, so the game's own libm runs. Balloons, tails and text are right; any other double maths DC does
+  (cameras, menus) is fixed with it.
+- Ruled out on the way, with switches kept for diagnosis: `DC_NO_DOF=1` (skips DepthOfField 0x1652C0),
+  `DC_SKIP_TBP=<block>` (skips DC's 2D sprites of one texture), `DC_PROBE_TEX=1` (texture manager list, full-screen
+  sprites, MGMoveImage, the balloon's fields, RollPos).
 - Note for probes: `sceVif1PkAddGsAD` is a runtime stub called directly (not overridable through the function table);
   game functions called with JAL go through the dispatcher and can be hooked with `registerFunction`.
