@@ -204,7 +204,8 @@ namespace dc::native
         // + 0x110, four light directions in their columns) times VU 5-7 (the local-to-world matrix's rows, normalised)
         // give the lights in the model's space (vf2-vf4); per vertex, d = max(0, vf2 n.x + vf3 n.y + vf4 n.z), one
         // component per light, and the colour is vf9 (VU 17, ambient) + vf5-vf8 (VU 13-16, the lights' colours) . d,
-        // kept to 254 (MINI by vf14.y), then FTOI0. The texture coordinates are scaled by VU 18's x (vf30).
+        // kept to 254 (MINI by vf14.y), then FTOI0. The model's main paths first multiply vf5-vf9 by the material's first
+        // quadword (VU 37, f256fcac190325a3 at 0xAD0 / 0xBF8). The texture coordinates are scaled by VU 18's x (vf30).
         struct Lighting
         {
             bool lit = false;
@@ -212,6 +213,7 @@ namespace dc::native
             float colour[4][4]{}; // vf5-vf8
             float ambient[4]{};   // vf9
             float uvScale = 1.0f; // vf30.x
+            float material[4] = {1.0f, 1.0f, 1.0f, 1.0f}; // VU 37 (the material's first quadword): scales vf5-vf9
         };
 
         Lighting lightingFrom(const uint8_t *rdram, uint32_t packet)
@@ -244,8 +246,9 @@ namespace dc::native
             uint32_t rgba = 0;
             for (int c = 0; c < 4; ++c)
             {
-                float v = l.ambient[c] + l.colour[0][c] * d[0] + l.colour[1][c] * d[1] + l.colour[2][c] * d[2] +
-                          l.colour[3][c] * d[3];
+                float v = (l.ambient[c] + l.colour[0][c] * d[0] + l.colour[1][c] * d[1] + l.colour[2][c] * d[2] +
+                           l.colour[3][c] * d[3]) *
+                          l.material[c];
                 v = std::min(v, 254.0f);
                 const uint32_t i = v > 0.0f ? static_cast<uint32_t>(v) : 0u;
                 rgba |= std::min(i, 255u) << (8 * c);
@@ -374,6 +377,11 @@ namespace dc::native
                 {
                     const uint32_t num = (code >> 16) & 0xFFu;
                     const bool tops = (code & 0x8000u) != 0u;
+                    // The material (SetMaterial: UNPACK to VU 0x25): its first quadword scales the lights and ambient
+                    // (the microprogram's MUL of vf5-vf9 by VU 37).
+                    if (!tops && (code & 0x3FFu) == 0x25u && num >= 1u)
+                        for (int c = 0; c < 4; ++c)
+                            lighting.material[c] = rdf(rdram, at + 16u + static_cast<uint32_t>(c) * 4u);
                     if (tops && num >= 2u)
                     {
                         const uint32_t header = at + 16u;
@@ -427,6 +435,39 @@ namespace dc::native
                 ++g_stats.empty;
         }
 
+        // DC_PROBE_TEX=1 (diagnosis): each caller of sceVif1PkAddGsAD that writes a TEX0 with an 8- or 4-bit PSM, once.
+        constexpr uint32_t kPkAddGsAD = 0x00121028u;
+        PS2Runtime::RecompiledFunction g_addGsAD = nullptr;
+        void addGsADProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+        {
+            const uint32_t reg = getRegU32(ctx, 5);
+            const uint64_t value = static_cast<uint64_t>(_mm_cvtsi128_si64(ctx->r[6]));
+            const uint32_t psm = static_cast<uint32_t>(value >> 20) & 0x3Fu;
+            const bool frame = (reg == 0x4Cu || reg == 0x4Du) &&
+                               ((static_cast<uint32_t>(value >> 24) & 0x3Fu) != 0u ||
+                                ((value & 0x1FFu) != 0u && (value & 0x1FFu) != 210u));
+            if (frame || (reg == 6u || reg == 7u) && (psm == 0x13u || psm == 0x14u || psm == 0x1Bu || psm == 0x24u || psm == 0x2Cu))
+            {
+                static std::mutex s_mutex;
+                static std::vector<uint32_t> s_seen;
+                const uint32_t ra = getRegU32(ctx, 31);
+                std::lock_guard<std::mutex> lock(s_mutex);
+                if (std::find(s_seen.begin(), s_seen.end(), ra) == s_seen.end() && s_seen.size() < 64u)
+                {
+                    s_seen.push_back(ra);
+                    if (frame)
+                        std::fprintf(stderr, "[dc:probe] FRAME fbp %u fbw %u psm 0x%x from ra 0x%08x\n",
+                                     static_cast<uint32_t>(value & 0x1FFu), static_cast<uint32_t>(value >> 16) & 0x3Fu,
+                                     static_cast<uint32_t>(value >> 24) & 0x3Fu, ra);
+                    else
+                        std::fprintf(stderr, "[dc:probe] TEX0 psm 0x%x tbp 0x%x tbw %u cbp 0x%x from ra 0x%08x\n", psm,
+                                     static_cast<uint32_t>(value & 0x3FFFu), static_cast<uint32_t>(value >> 14) & 0x3Fu,
+                                     static_cast<uint32_t>(value >> 37) & 0x3FFFu, ra);
+                }
+            }
+            g_addGsAD(rdram, ctx, runtime);
+        }
+
         bool g_enabled = false;
     }
 
@@ -437,6 +478,14 @@ namespace dc::native
 
     void install(PS2Runtime &runtime)
     {
+        // DC_NO_DOF=1 (diagnosis): DepthOfField (0x1652C0, the cutscenes' blur behind the focus plane) does nothing.
+        if (const char *noDof = std::getenv("DC_NO_DOF"); noDof && noDof[0] == '1')
+            runtime.registerFunction(0x001652C0u, [](uint8_t *, R5900Context *ctx, PS2Runtime *) {
+                ctx->pc = getRegU32(ctx, 31);
+            });
+        if (const char *probe = std::getenv("DC_PROBE_TEX"); probe && probe[0] == '1')
+            if ((g_addGsAD = runtime.lookupFunction(kPkAddGsAD)))
+                runtime.registerFunction(kPkAddGsAD, &addGsADProbe);
         const char *on = std::getenv("DC_NATIVE3D");
         if (!(on && on[0] == '1'))
             return;
@@ -491,5 +540,32 @@ namespace dc::native
         }
         renderer.endFrame();
         renderer.beginFrame(screen());
+    }
+
+    // DC_PROBE_TEX=1 (diagnosis): the texture manager's (0x1C75870) textures, every 600 frames: count at +0, entries
+    // of 0x50 bytes from +0x10F8, each with its TEX0 at +0x28.
+    void probeTextures(const uint8_t *rdram)
+    {
+        static const bool on = [] { const char *v = std::getenv("DC_PROBE_TEX"); return v && v[0] == '1'; }();
+        static uint32_t s_frames = 0;
+        if (!on || ++s_frames % 600u != 0u)
+            return;
+        const uint32_t manager = 0x01C75870u, count = rd32(rdram, manager);
+        std::fprintf(stderr, "[dc:probe] frame %u: %u textures\n", s_frames, count);
+        for (uint32_t i = 0; i < count && i < 512u; ++i)
+        {
+            const uint32_t entry = manager + 0x10F8u + i * 0x50u;
+            const uint64_t tex0 = rd64(rdram, entry + 0x28u);
+            char name[33] = {};
+            for (uint32_t k = 0; k < 32u; ++k)
+            {
+                const char c = static_cast<char>(rdram[(entry + k) & 0x1FFFFFFu]);
+                name[k] = (c >= 32 && c < 127) ? c : '.';
+            }
+            std::fprintf(stderr, "[dc:probe]  %3u tbp %5u tbw %2u psm 0x%02x tw %u th %u cbp %5u  %s\n", i,
+                         static_cast<uint32_t>(tex0 & 0x3FFFu), static_cast<uint32_t>(tex0 >> 14) & 0x3Fu,
+                         static_cast<uint32_t>(tex0 >> 20) & 0x3Fu, static_cast<uint32_t>(tex0 >> 26) & 0xFu,
+                         static_cast<uint32_t>(tex0 >> 30) & 0xFu, static_cast<uint32_t>(tex0 >> 37) & 0x3FFFu, name);
+        }
     }
 }

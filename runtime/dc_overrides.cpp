@@ -18,6 +18,7 @@ namespace dc::native
 {
     void install(PS2Runtime &runtime);
     void publish();
+    void probeTextures(const uint8_t *rdram);
 }
 
 namespace
@@ -40,10 +41,10 @@ namespace
 
     void nativeFrameEnd(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        (void)rdram;
         const uint32_t ra = getRegU32(ctx, 31);
         g_frames.fetch_add(1u, std::memory_order_relaxed);
         dc::native::publish();
+        dc::native::probeTextures(rdram);
         static auto s_next = std::chrono::steady_clock::now();
         const uint32_t cap = runtime->framePacer().cap();
         const auto now = std::chrono::steady_clock::now();
