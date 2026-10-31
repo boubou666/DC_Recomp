@@ -175,3 +175,11 @@ from the ELF's own symbols.
   order, a texture made of the uploads still showing in its blocks) addresses this; it conflicts with
   `native/renderer` in native_renderer / native_texture_cache, asked on f2f how to bring it in.
   `DC_PROBE_FACES=1` logs characters' GS registers and writes their textures as the cache decodes them.
+- Textures from the game's own assets (2026-10-31): the adapter hooks ReloadTexture (0x133070) and notes, per TEX0,
+  which CTextureManager record (pixels, palette, size, sent-as-32-bit flag) the game just sent there, in the EE's
+  order; each model draw decodes its texture from that asset in main memory and hands it to the renderer
+  (`Renderer::draw` with a texture, PS2Recomp dc/native c66bb03). No GS packet tap, no GS memory. The Mayor's face is
+  right now, and frames are faster (decoded textures reused). Still open: textures DC sends another way (no
+  ReloadTexture record) fall back to the native texture cache, which is fed from GS uploads (GS-side: to replace by
+  hooking those routines too); one character in front of a pillar mostly missing (depth or alpha, not texture).
+  VP2S agreed on f2f that their GS-side texture store is not compliant and moved VP2 to the same EE-side approach.
