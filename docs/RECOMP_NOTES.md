@@ -160,3 +160,9 @@ from the ELF's own symbols.
   sprites, MGMoveImage, the balloon's fields, RollPos).
 - Note for probes: `sceVif1PkAddGsAD` is a runtime stub called directly (not overridable through the function table);
   game functions called with JAL go through the dispatcher and can be hooked with `registerFunction`.
+- Faces in native 3D: some come out speckled (the Mayor) or pale (the Colonel). Feeding the native texture cache the
+  GS-to-GS copies DC's face animation makes (TexAnime -> MGMoveImage, TRXDIR 2) changed nothing, so it was not kept.
+  Next suspects: the face texture's format / CLUT as the adapter passes it (TEX0 from the VU data's DIRECT, CBP / CSA
+  of 4-bit textures), and TEX1 / mipmaps.
+- Near and far: triangles are clipped to the microprogram's clip box (|z| <= w) before drawing. Characters still show
+  through a pillar right at the camera in one cutscene shot; it may be DC fading occluders, not confirmed.
