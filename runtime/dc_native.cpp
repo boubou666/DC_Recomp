@@ -391,6 +391,23 @@ namespace dc::native
             triangles.swap(out);
         }
 
+        // DC_PROBE_FACES=1 (diagnosis): the GS registers of characters' VU data (CFrame draws: TEX0, TEX1, CLAMP, ...),
+        // each distinct (register, value) logged once; their textures written as the native cache decodes them.
+        const bool g_probeFaces = [] { const char *v = std::getenv("DC_PROBE_FACES"); return v && v[0] == '1'; }();
+        std::mutex g_faceMutex;
+        std::vector<uint64_t> g_faceSeen, g_faceTex0s;
+        void noteFaceRegister(uint32_t reg, uint64_t value)
+        {
+            std::lock_guard<std::mutex> lock(g_faceMutex);
+            const uint64_t key = value * 0x9E3779B97F4A7C15ull ^ reg;
+            if (std::find(g_faceSeen.begin(), g_faceSeen.end(), key) != g_faceSeen.end() || g_faceSeen.size() >= 400u)
+                return;
+            g_faceSeen.push_back(key);
+            std::fprintf(stderr, "[dc:faces] reg 0x%02x = %016llx\n", reg, static_cast<unsigned long long>(value));
+            if (reg == 0x06u)
+                g_faceTex0s.push_back(value);
+        }
+
         // The visual's VU data (CreateVUdataFromMDT's layout) drawn with the packet's object-to-screen matrix.
         // The GS state a draw gets besides its VU data: DrawVu1's PRMODE (packet word 0x10: ABE always, TME unless
         // RenderInfo + 0x340, FGE for fog) and, for a CFrame's visual, the TEST / ZBUF / ALPHA that SetGsReg3
@@ -508,6 +525,8 @@ namespace dc::native
                             material.tex0 = value;
                             material.textured = textureMapped;
                         }
+                        if (g_probeFaces && state.hasRegs && drawn)
+                            noteFaceRegister(reg, value);
                     }
                     q += 1u + n;
                 }
@@ -805,6 +824,41 @@ namespace dc::native
     // of 0x50 bytes from +0x10F8, each with its TEX0 at +0x28.
     void probeTextures(const uint8_t *rdram)
     {
+        // DC_PROBE_FACES=1: every 600 frames, the characters' textures noted since, as the native cache decodes them
+        // (PPM files in PS2X_CAPTURE_DIR).
+        if (g_probeFaces)
+        {
+            static uint32_t s_faceFrames = 0;
+            if (++s_faceFrames % 600u == 0u)
+            {
+                std::vector<uint64_t> tex0s;
+                {
+                    std::lock_guard<std::mutex> lock(g_faceMutex);
+                    tex0s.swap(g_faceTex0s);
+                }
+                const char *dir = std::getenv("PS2X_CAPTURE_DIR");
+                for (const uint64_t tex0 : tex0s)
+                {
+                    auto texture = ps2x::native::Renderer::instance().textures().texture(tex0);
+                    if (!texture || texture->width == 0u)
+                        continue;
+                    char path[1024];
+                    std::snprintf(path, sizeof(path), "%s/face_%016llx.ppm", dir && *dir ? dir : ".",
+                                  static_cast<unsigned long long>(tex0));
+                    if (FILE *f = std::fopen(path, "wb"))
+                    {
+                        std::fprintf(f, "P6\n%u %u\n255\n", texture->width, texture->height);
+                        for (const uint32_t px : texture->rgba)
+                        {
+                            const uint8_t rgb[3] = {static_cast<uint8_t>(px), static_cast<uint8_t>(px >> 8),
+                                                    static_cast<uint8_t>(px >> 16)};
+                            std::fwrite(rgb, 1, 3, f);
+                        }
+                        std::fclose(f);
+                    }
+                }
+            }
+        }
         static const bool on = [] { const char *v = std::getenv("DC_PROBE_TEX"); return v && v[0] == '1'; }();
         static uint32_t s_frames = 0;
         if (!on || ++s_frames % 600u != 0u)

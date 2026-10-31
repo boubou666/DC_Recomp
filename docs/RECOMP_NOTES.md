@@ -166,3 +166,12 @@ from the ELF's own symbols.
   of 4-bit textures), and TEX1 / mipmaps.
 - Near and far: triangles are clipped to the microprogram's clip box (|z| <= w) before drawing. Characters still show
   through a pillar right at the camera in one cutscene shot; it may be DC fading occluders, not confirmed.
+- Faces, narrowed (2026-10-31): DC uploads each character's texture just before its draw (ReloadTexture in the VIF1
+  packet), into overlapping places (256x256 PSMT8 at blocks 6720, 6816, 7008, 7104, CLUT right after the texels).
+  A same-moment A/B (`DC_NATIVE3D_VU1=1` with `PS2X_NATIVE_CAPTURE_DIR`: the GS frame drawn by VU1 next to the native
+  frame decoded at draw time) shows nearly every character texture wrong when decoded at draw time; with stream
+  draws (decoded at the group marker) most are right and some faces still are not. So it is when the native texture
+  cache decodes against the uploads, not the geometry. VP2S's `native/gs-backend` texture store (uploads in global
+  order, a texture made of the uploads still showing in its blocks) addresses this; it conflicts with
+  `native/renderer` in native_renderer / native_texture_cache, asked on f2f how to bring it in.
+  `DC_PROBE_FACES=1` logs characters' GS registers and writes their textures as the cache decodes them.
