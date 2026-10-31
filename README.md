@@ -27,16 +27,31 @@ Not an emulator: the game's own MIPS R5900 code, rebuilt as a native program on 
 
 **Bring-up, not playable yet.** On the full native path the game boots, finds its memory card, plays its 3D intro,
 shows the title screen and its attract demo, and New game plays the opening in the Dark Shrine (name entry,
-Colonel Flag, the Dark Genie) at 56-60 fps with music. A total recompilation like the other ports of the fork: the game's code, its overlays, its IOP modules
-and its VU1 microcode all run as native code, drawn by the native GS renderer. Nothing is emulated, and paraLLEl-GS is
-not used.
+Colonel Flag, the Dark Genie) at 56-60 fps with music. The goal, as for the other ports of the fork, is no PS2
+emulation at all; paraLLEl-GS is never used. Native today: the game's code and overlays (recompiled), its IOP modules
+(recompiled), the frame loop and sound on the PC clock, and, with `DC_NATIVE3D=1`, its 3D models: the adapter
+(`runtime/dc_native.cpp`) reads each model's own data (strips, normals, materials, lights) where the game draws it and
+draws it with the PC GPU, lit as the game's VU1 program lights it, and VU1 skips those programs.
+
+**Still emulated, and being removed:**
+
+| Part | How it runs today |
+|---|---|
+| VU1 programs the adapter does not translate yet (shadows, screen-space sprites, particles, other effects) | VU1 microcode run by the generic VU1 AOT, which steps an interpreter: emulation |
+| Menus, HUD, text, 2D, the cutscenes' depth of field, everything sent to the GS as packets | the fork's GS front end interprets the GS packets (registers, GS memory layout) and draws them with OpenGL |
+| DMA, VIF / GIF packet handling, EE kernel HLE, IPU | the runtime's hardware layer |
+
+Known defects: the cutscenes' depth of field shows colour stripes behind the dialogue (the GS front end's copy of the
+frame, under investigation), black blocks in some Norune scenes.
 
 | Milestone | |
 |---|:---:|
 | Function map from the ELF's own symbol table (main program and both overlays, no Ghidra) | ✅ |
 | Recompile the main ELF and link it with the PS2Recomp runtime (Windows) | ✅ |
 | Code overlays `TITLE.BIN` and `DUN.BIN` (one load slot, picked by their header) | ✅ |
-| VU1 microcode compiled ahead of time (`ps2_vu_aot`) | ✅ |
+| 3D models drawn natively from the game's data, lit like VU1 (`DC_NATIVE3D=1`) | 🔧 |
+| Every VU1 program translated (no VU1 microcode run) | ⏳ |
+| Menus, text and 2D drawn natively (no GS packets interpreted) | ⏳ |
 | Boot: EE kernel, CD reads from the disc files, memory card detected | ✅ |
 | The game's IOP modules recompiled to native code (9 modules, nothing interpreted) | ✅ |
 | Intro, title screen, in-game 3D scenes after the title (native GS renderer) | ✅ |
@@ -77,9 +92,10 @@ disc files (game/) ──► tools/symtab_map.py (the ELF's symbol table) ──
    TITLE.BIN, DUN.BIN ──► tools/wrap_elf.py + tools/symtab_map.py ──► ps2_recomp in module mode ──► generated/overlays/
    the game's IRX (dumped by a first run) ──► the fork's tools/iop_recomp.py ──► generated/iop/
                                            │
-                 CMakeLists.txt ──► PS2Recomp runtime + generated code + runtime/dc_overrides.cpp
+                 CMakeLists.txt ──► PS2Recomp runtime + generated code + runtime/dc_overrides.cpp, dc_native.cpp
                                            │
-   PS2Recomp runtime: EE kernel HLE · DMAC · GIF · native GS renderer (OpenGL) · VIF/VU0/VU1 · IPU ─┼─► ps2EntryRunner
+   DC's native 3D (dc_native.cpp: the game's models, lit, drawn by the PC GPU; VU1 skips them) ─┐
+   still emulated: VU1 for the programs not translated · GS front end for 2D · DMAC / VIF / GIF · IPU ─┼─► ps2EntryRunner
    PS2Recomp IOP:     the game's own IRX as native code · SPU2 and IOP on the PC clock · SIO2
 ```
 
@@ -90,7 +106,10 @@ disc files (game/) ──► tools/symtab_map.py (the ELF's symbol table) ──
   PS2Recomp overlay module; at run time the one whose header is in guest memory is called.
 - The top-level `CMakeLists.txt` builds the fork's runtime, swaps its placeholder function table for the generated one
   and links everything into `ps2EntryRunner`.
-- `runtime/dc_overrides.cpp` holds the game-specific bindings.
+- `runtime/dc_overrides.cpp` holds the game-specific bindings; `runtime/dc_native.cpp` is the native 3D adapter: it
+  hooks `CVisualVu1::DrawVu1` (0x135000), walks the model's VU data (DIRECT TEX0, material, strips of positions,
+  normals, UVs and colours) and draws it with the fork's native renderer, lit by the microprogram's own formula
+  (lights from the DrawVu1 header, the material's colour); a VIF1 observer tells VU1 which programs to skip.
 
 The PS2Recomp fork lives in `PS2Recomp/` (git submodule, [boubou666/PS2Recomp](https://github.com/boubou666/PS2Recomp),
 branch `dc/native`, cut from `native/renderer`), shared with the *Twisted Metal: Black*, *The Third Age*,
