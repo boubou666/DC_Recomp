@@ -16,6 +16,7 @@
 #include "ps2_runtime.h"
 #include "runtime/native/native_renderer.h"
 #include "runtime/native/native_vif1.h"
+#include "runtime/gs/ps2_gs_memory.h"
 
 #include <algorithm>
 #include <atomic>
@@ -24,7 +25,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <memory>
 #include <mutex>
+#include <unordered_map>
 #include <vector>
 
 namespace dc::native
@@ -408,6 +411,142 @@ namespace dc::native
                 g_faceTex0s.push_back(value);
         }
 
+        // Textures from the game's own assets, not from GS uploads. DC keeps every texture in main memory, in its
+        // CTextureManager records (0x50 bytes from + 0x10F8: group, width, height, kind, TEX0 at + 0x28, the levels'
+        // pixels at + 0x38.., the palette at + 0x48, a "sent as 32-bit" flag at + 0x4C), and ReloadTexture (0x133070)
+        // sends a group of them to VRAM before the draws that use it, several groups taking turns in the same place.
+        // The hook notes, in the game's own order (the EE's, as it builds the frame), which record each TEX0 shows;
+        // a draw's texture is decoded from that record's pixels and palette.
+        struct GameTexture
+        {
+            uint32_t pixels = 0, palette = 0, bytes = 0;
+            bool sentAs32 = false; // 8-bit texels stored pre-swizzled, sent as a CT32 image of half the width
+        };
+        constexpr uint32_t kReloadTexture = 0x00133070u;
+        bool g_gameTextures = false;
+        PS2Runtime::RecompiledFunction g_reloadTexture = nullptr;
+        std::unordered_map<uint64_t, GameTexture> g_shownTextures; // by TEX0 (format, place, size, palette)
+        uint64_t textureKey(uint64_t tex0)
+        {
+            return tex0 & ~(7ull << 34) & ~(7ull << 61); // without TCC / TFX and CLD
+        }
+
+        void reloadTextureHook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+        {
+            const uint32_t manager = getRegU32(ctx, 4);
+            const int32_t group = static_cast<int32_t>(getRegU32(ctx, 6));
+            g_reloadTexture(rdram, ctx, runtime);
+            if (group < 0 || group >= 0x48)
+                return;
+            const uint32_t count = rd32(rdram, manager);
+            for (uint32_t i = 1; i < count && i < 1024u; ++i)
+            {
+                const uint32_t record = manager + 0x10F8u + i * 0x50u;
+                if (static_cast<int16_t>(rd32(rdram, record) & 0xFFFFu) != group)
+                    continue;
+                const uint32_t w = rd32(rdram, record) >> 16, h = rd32(rdram, record + 4u) & 0xFFFFu;
+                const uint32_t kind = rd32(rdram, record + 4u) >> 16;
+                const uint64_t tex0 = rd64(rdram, record + 0x28u);
+                GameTexture texture;
+                texture.pixels = rd32(rdram, record + 0x38u);
+                texture.palette = kind == 1u ? rd32(rdram, record + 0x48u) : 0u;
+                texture.sentAs32 = kind == 1u && rd32(rdram, record + 0x4Cu) != 0u;
+                texture.bytes = (kind == 1u ? 1u : 4u) * w * h; // ReloadTexture's level 0: kind x w x h / 16 qwords
+                if (texture.pixels != 0u && texture.bytes != 0u)
+                    g_shownTextures[textureKey(tex0)] = texture;
+            }
+        }
+
+        std::vector<uint8_t> g_unswizzle; // a GS-layout scratch for assets stored pre-swizzled
+        std::unordered_map<uint64_t, std::pair<uint64_t, std::shared_ptr<const ps2x::native::TextureCache::Texture>>> g_decoded;
+        uint64_t g_textureVersion = 0;
+
+        uint64_t contentHash(const uint8_t *rdram, uint32_t address, uint32_t bytes, uint64_t hash)
+        {
+            for (uint32_t i = 0; i + 4u <= bytes; i += 4u)
+                hash = (hash ^ rd32(rdram, address + i)) * 0x100000001B3ull;
+            return hash;
+        }
+
+        // The texture TEX0 shows as the game drew it, from its asset; null when no record shows it (textures sent
+        // another way: drawn from the GS uploads as before).
+        std::shared_ptr<const ps2x::native::TextureCache::Texture> gameTexture(const uint8_t *rdram, uint64_t tex0)
+        {
+            const auto shown = g_shownTextures.find(textureKey(tex0));
+            if (shown == g_shownTextures.end())
+                return nullptr;
+            const GameTexture &asset = shown->second;
+            const uint32_t tbp = tex0 & 0x3FFFu, tbw = std::max<uint32_t>((tex0 >> 14) & 0x3Fu, 1u);
+            const uint32_t psm = (tex0 >> 20) & 0x3Fu;
+            const uint32_t tw = (tex0 >> 26) & 0xFu, th = (tex0 >> 30) & 0xFu;
+            const uint32_t cpsm = (tex0 >> 51) & 0xFu, csa = (tex0 >> 56) & 0x1Fu;
+            if ((psm != 0x13u && psm != 0x14u && psm != 0x00u) || (psm != 0x00u && (cpsm != 0u || asset.palette == 0u)) ||
+                tw > 10u || th > 10u)
+                return nullptr;
+            // Decoded again only when the asset's texels or palette change (an identical one finds its texture).
+            const uint32_t sample = std::min<uint32_t>(asset.bytes, 4096u);
+            uint64_t hash = contentHash(rdram, asset.pixels, sample, 0xCBF29CE484222325ull);
+            hash = contentHash(rdram, asset.pixels + asset.bytes - sample, sample, hash ^ asset.pixels);
+            if (asset.palette != 0u)
+                hash = contentHash(rdram, asset.palette, 1024u, hash ^ asset.palette);
+            const uint64_t key = textureKey(tex0) ^ (static_cast<uint64_t>(asset.pixels) << 1);
+            auto &slot = g_decoded[key];
+            if (slot.second && slot.first == hash)
+                return slot.second;
+
+            auto texture = std::make_shared<ps2x::native::TextureCache::Texture>();
+            texture->width = 1u << tw;
+            texture->height = 1u << th;
+            texture->rgba.assign(static_cast<size_t>(texture->width) * texture->height, 0u);
+            texture->key = key;
+            texture->version = ++g_textureVersion;
+            const uint32_t rowTexels = tbw * 64u;
+            const uint32_t bitsPerTexel = psm == 0x13u ? 8u : psm == 0x14u ? 4u : 32u;
+            const uint32_t rows = asset.bytes * 8u / (rowTexels * bitsPerTexel);
+            auto alpha = [](uint32_t a) { return a >= 0x80u ? 255u : a * 2u; };
+            auto colour = [&](uint32_t c) { return (c & 0x00FFFFFFu) | alpha(c >> 24) << 24; };
+            // 8-bit texels sent as CT32 (half the width): laid out as the GS stores that image, read back as 8-bit.
+            const uint32_t bw32 = std::max<uint32_t>(tbw / 2u, 1u), width32 = bw32 * 64u;
+            const uint32_t rows32 = asset.sentAs32 ? asset.bytes / (width32 * 4u) : 0u;
+            if (asset.sentAs32)
+            {
+                g_unswizzle.resize(4u * 1024u * 1024u);
+                for (uint32_t y = 0; y < rows32; ++y)
+                    for (uint32_t x = 0; x < width32; ++x)
+                        GSMem::WriteCT32(g_unswizzle.data(), tbp, bw32, x, y, rd32(rdram, asset.pixels + (y * width32 + x) * 4u));
+            }
+            const uint32_t texelRows = asset.sentAs32 ? rows32 * 2u : rows;
+            for (uint32_t y = 0; y < texture->height && y < texelRows; ++y)
+                for (uint32_t x = 0; x < texture->width && x < rowTexels; ++x)
+                {
+                    uint32_t texel = 0;
+                    if (psm == 0x00u)
+                        texel = colour(rd32(rdram, asset.pixels + (y * rowTexels + x) * 4u));
+                    else
+                    {
+                        uint32_t index = 0;
+                        if (asset.sentAs32)
+                            index = psm == 0x13u ? GSMem::ReadP8(g_unswizzle.data(), tbp, tbw, x, y)
+                                                 : GSMem::ReadP4(g_unswizzle.data(), tbp, tbw, x, y);
+                        else if (psm == 0x13u)
+                            index = rdram[(asset.pixels + y * rowTexels + x) & 0x1FFFFFFu];
+                        else
+                        {
+                            const uint32_t at = y * rowTexels + x;
+                            index = (rdram[(asset.pixels + at / 2u) & 0x1FFFFFFu] >> ((at & 1u) * 4u)) & 0xFu;
+                        }
+                        // The palette as the game sends it (a 16 x 16 CT32 image for 256 colours, which CSM1 reads with
+                        // entries 8-15 and 16-23 of each 32 swapped), and CSA's offset for 16 colours.
+                        const uint32_t entry = psm == 0x13u ? (index & 0xE7u) | ((index & 0x08u) << 1) | ((index & 0x10u) >> 1)
+                                                            : csa * 16u + index;
+                        texel = colour(rd32(rdram, asset.palette + entry * 4u));
+                    }
+                    texture->rgba[static_cast<size_t>(y) * texture->width + x] = texel;
+                }
+            slot = {hash, texture};
+            return texture;
+        }
+
         // The visual's VU data (CreateVUdataFromMDT's layout) drawn with the packet's object-to-screen matrix.
         // The GS state a draw gets besides its VU data: DrawVu1's PRMODE (packet word 0x10: ABE always, TME unless
         // RenderInfo + 0x340, FGE for fog) and, for a CFrame's visual, the TEST / ZBUF / ALPHA that SetGsReg3
@@ -499,7 +638,11 @@ namespace dc::native
                         clipDepth(clip, vertices);
                     if (drawn && !vertices.empty())
                     {
-                        renderer.draw(material, matrix, vertices.data(), static_cast<uint32_t>(vertices.size()));
+                        auto own = material.textured && g_gameTextures ? gameTexture(rdram, material.tex0) : nullptr;
+                        if (own)
+                            renderer.draw(material, matrix, vertices.data(), static_cast<uint32_t>(vertices.size()), own);
+                        else
+                            renderer.draw(material, matrix, vertices.data(), static_cast<uint32_t>(vertices.size()));
                         g_stats.triangles += vertices.size() / 3u;
                     }
                     vertices.clear();
@@ -768,6 +911,13 @@ namespace dc::native
             return;
         }
         runtime.registerFunction(kVisualDrawVu1, &drawVu1Hook);
+        // DC_GAME_TEXTURES=0: the models' textures from the GS uploads, as before (to compare).
+        if (const char *own = std::getenv("DC_GAME_TEXTURES"); !(own && own[0] == '0'))
+            if ((g_reloadTexture = runtime.lookupFunction(kReloadTexture)))
+            {
+                runtime.registerFunction(kReloadTexture, &reloadTextureHook);
+                g_gameTextures = true;
+            }
         ps2x::native::Renderer &renderer = ps2x::native::Renderer::instance();
         renderer.setEnabled(true);
         renderer.beginFrame(screen());
