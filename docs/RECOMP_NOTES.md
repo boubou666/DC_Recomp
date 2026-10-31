@@ -135,3 +135,26 @@ from the ELF's own symbols.
   3. Control of Toan in Norune not reached yet in the scripted runs.
 - Tooling: window at 4:3 (`PS2X_WINDOW_SIZE=960x720` in `scripts/run.sh`), boot tests ignore the PC's gamepads and
   save their settings in `env.txt`.
+
+## Native 3D and the cutscene stripes (2026-10-31)
+
+- Native 3D (`DC_NATIVE3D=1`, `runtime/dc_native.cpp`): the model's material colour (its first quadword, unpacked
+  to VU 0x25) now scales the lights and ambient, as the model microprogram does (f256fcac190325a3 at 0xAD0 / 0xBF8).
+- Counted over a 280 s boot (intro, title, name entry, Dark Shrine, cutscenes) and the Norune runs: every MSCAL VU1
+  was asked about was drawn natively (`gate: N MSCALs ... N drawn here`), and no DrawVu1 call was left to VU1 (0
+  shadows, 0 program-0xF). VU1 runs no microcode in those scenes; shadows (RenderInfo + 0x320) and the screen-space
+  program will need translating once a scene uses them.
+- The stripes over the cutscene dialogues (whole screen, and inside the message box) are **not** the GS back end:
+  the CPU GS reference (`PS2X_GS_RENDERER=cpu`, `DC_NATIVE3D=0`) shows the same stripes and white frames. Ruled out
+  so far:
+  - DepthOfField (0x1652C0, the cutscene blur, `DC_NO_DOF=1` skips it): stripes unchanged.
+  - The speech balloon render target: `fukidashibase` is CT32 at fbp 227 (`DC_PROBE_TEX=1` lists the texture
+    manager), no PSMT8 target is drawn.
+  - The cutscene frame capture (EdSaveFrameImageTask -> MGMoveFrameBuffImage -> MGMoveImage, 448 one-line GS copies):
+    MGMoveImage is never called before the stripes appear.
+  - The message text work area (block 6720, fbp 210) is shared with DoF's `work` texture and `frame_image(_mes)`; the
+    text code copies PSMT8 glyph rows there (local-to-local, 128x40). A full-screen draw of a texture over that area
+    would show glyph bytes as colour: next suspect. To find: the draw that covers the screen during a message (its
+    TEX0 and the code that sends it).
+- Note for probes: `sceVif1PkAddGsAD` is a runtime stub called directly (not overridable through the function table);
+  game functions called with JAL go through the dispatcher and can be hooked with `registerFunction`.

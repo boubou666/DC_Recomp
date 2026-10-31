@@ -38,6 +38,7 @@ namespace dc::native
         struct Stats
         {
             uint64_t calls = 0, empty = 0, noData = 0, visuals = 0, strips = 0, triangles = 0, skipped = 0;
+            uint64_t shadows = 0, screenSpace = 0; // DrawVu1 calls left to VU1: RenderInfo + 0x320 set, program 0xF
         } g_stats;
 
         uint32_t rd32(const uint8_t *rdram, uint32_t address)
@@ -428,7 +429,10 @@ namespace dc::native
             ++g_stats.calls;
             g_drawVu1(rdram, ctx, runtime);
             // Shadow volumes (RenderInfo + 0x320) and screen-space programs (0xF, FST) stay on VU1 for now.
-            const bool drawn = rd32(rdram, renderInfo + 0x320u) == 0u && program != 0xFu;
+            const bool shadow = rd32(rdram, renderInfo + 0x320u) != 0u, screenSpace = program == 0xFu;
+            const bool drawn = !shadow && !screenSpace;
+            g_stats.shadows += shadow ? 1u : 0u;
+            g_stats.screenSpace += screenSpace ? 1u : 0u;
             if (getRegU32(ctx, 2) != 0u)
                 drawVisual(rdram, visual, packet, drawn, lit);
             else
@@ -468,6 +472,24 @@ namespace dc::native
             g_addGsAD(rdram, ctx, runtime);
         }
 
+        // DC_PROBE_TEX=1: MGMoveImage(src TEX0 *, rect *, dst TEX0 *, dx, dy, dir) (0x12F210), its first calls.
+        PS2Runtime::RecompiledFunction g_moveImage = nullptr;
+        void moveImageProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+        {
+            static std::atomic<uint32_t> s_logged{0};
+            if (s_logged.fetch_add(1u) < 40u)
+            {
+                const uint32_t rect = getRegU32(ctx, 5);
+                std::fprintf(stderr, "[dc:probe] MGMoveImage src %016llx rect %d,%d %dx%d dst %016llx at %u,%u ra 0x%08x\n",
+                             static_cast<unsigned long long>(rd64(rdram, getRegU32(ctx, 4))),
+                             static_cast<int>(rd32(rdram, rect)), static_cast<int>(rd32(rdram, rect + 4u)),
+                             static_cast<int>(rd32(rdram, rect + 8u)), static_cast<int>(rd32(rdram, rect + 12u)),
+                             static_cast<unsigned long long>(rd64(rdram, getRegU32(ctx, 6))), getRegU32(ctx, 7),
+                             getRegU32(ctx, 8), getRegU32(ctx, 31));
+            }
+            g_moveImage(rdram, ctx, runtime);
+        }
+
         bool g_enabled = false;
     }
 
@@ -484,8 +506,12 @@ namespace dc::native
                 ctx->pc = getRegU32(ctx, 31);
             });
         if (const char *probe = std::getenv("DC_PROBE_TEX"); probe && probe[0] == '1')
+        {
             if ((g_addGsAD = runtime.lookupFunction(kPkAddGsAD)))
                 runtime.registerFunction(kPkAddGsAD, &addGsADProbe);
+            if ((g_moveImage = runtime.lookupFunction(0x0012F210u)))
+                runtime.registerFunction(0x0012F210u, &moveImageProbe);
+        }
         const char *on = std::getenv("DC_NATIVE3D");
         if (!(on && on[0] == '1'))
             return;
@@ -522,11 +548,12 @@ namespace dc::native
         if (++s_frames % 300u == 0u)
         {
             std::fprintf(stderr, "[dc:native] per 300 frames: %llu calls (%llu empty, %llu without data), %llu visuals, "
-                                 "%llu strips, %llu triangles, %llu skipped\n",
+                                 "%llu strips, %llu triangles, %llu skipped; left to VU1: %llu shadows, %llu screen-space\n",
                          static_cast<unsigned long long>(g_stats.calls), static_cast<unsigned long long>(g_stats.empty),
                          static_cast<unsigned long long>(g_stats.noData),
                          static_cast<unsigned long long>(g_stats.visuals), static_cast<unsigned long long>(g_stats.strips),
-                         static_cast<unsigned long long>(g_stats.triangles), static_cast<unsigned long long>(g_stats.skipped));
+                         static_cast<unsigned long long>(g_stats.triangles), static_cast<unsigned long long>(g_stats.skipped),
+                         static_cast<unsigned long long>(g_stats.shadows), static_cast<unsigned long long>(g_stats.screenSpace));
             std::fprintf(stderr, "[dc:native] gate: %llu MSCALs, %llu with a decision, %llu drawn here; observer: "
                                  "%llu pieces, %llu V4-32 unpacks, %llu model strips; last TOPS tag 0x%08x, last PRMODE 0x%x\n",
                          static_cast<unsigned long long>(g_gateCalls.exchange(0)),
