@@ -305,6 +305,92 @@ namespace dc::native
             }
         }
 
+        // The microprogram clips each triangle to its clip box (CLIPW against VU 24-27, |x|, |y|, |z| <= w; the
+        // clipping routine at 0x1C38 of f256fcac190325a3) and draws what is inside. The renderer clamps depth instead
+        // of clipping it and keeps GS Z to 24 bits, so a wall right at the camera came out behind what stood past it:
+        // here triangles are clipped to the near and far planes (z = -w, z = w) in that clip space, the new vertices
+        // interpolated in the object's space (clip coordinates are linear in it). x and y are left to the GPU.
+        void clipDepth(const float clip[16], std::vector<ps2x::native::Vertex> &triangles)
+        {
+            using ps2x::native::Vertex;
+            struct Clipped
+            {
+                Vertex v;
+                float z, w;
+            };
+            auto toClip = [&](const Vertex &v) {
+                const float z = clip[0 * 4 + 2] * v.x + clip[1 * 4 + 2] * v.y + clip[2 * 4 + 2] * v.z + clip[3 * 4 + 2];
+                const float w = clip[0 * 4 + 3] * v.x + clip[1 * 4 + 3] * v.y + clip[2 * 4 + 3] * v.z + clip[3 * 4 + 3];
+                return Clipped{v, z, w};
+            };
+            auto lerp = [](const Clipped &a, const Clipped &b, float t) {
+                Clipped c;
+                c.v.x = a.v.x + (b.v.x - a.v.x) * t;
+                c.v.y = a.v.y + (b.v.y - a.v.y) * t;
+                c.v.z = a.v.z + (b.v.z - a.v.z) * t;
+                c.v.u = a.v.u + (b.v.u - a.v.u) * t;
+                c.v.v = a.v.v + (b.v.v - a.v.v) * t;
+                c.v.fog = a.v.fog + (b.v.fog - a.v.fog) * t;
+                c.v.q = a.v.q + (b.v.q - a.v.q) * t;
+                uint32_t rgba = 0;
+                for (int k = 0; k < 4; ++k)
+                {
+                    const float ca = static_cast<float>((a.v.rgba >> (k * 8)) & 0xFFu);
+                    const float cb = static_cast<float>((b.v.rgba >> (k * 8)) & 0xFFu);
+                    rgba |= static_cast<uint32_t>(std::clamp(ca + (cb - ca) * t + 0.5f, 0.0f, 255.0f)) << (k * 8);
+                }
+                c.v.rgba = rgba;
+                c.z = a.z + (b.z - a.z) * t;
+                c.w = a.w + (b.w - a.w) * t;
+                return c;
+            };
+            // Distance to a plane, inside >= 0: near z + w, far w - z.
+            auto nearDistance = [](const Clipped &c) { return c.z + c.w; };
+            auto farDistance = [](const Clipped &c) { return c.w - c.z; };
+            std::vector<Vertex> out;
+            out.reserve(triangles.size());
+            Clipped polygon[9], next[9];
+            for (size_t i = 0; i + 2 < triangles.size(); i += 3)
+            {
+                Clipped a = toClip(triangles[i]), b = toClip(triangles[i + 1]), c = toClip(triangles[i + 2]);
+                const bool inside = nearDistance(a) >= 0.0f && nearDistance(b) >= 0.0f && nearDistance(c) >= 0.0f &&
+                                    farDistance(a) >= 0.0f && farDistance(b) >= 0.0f && farDistance(c) >= 0.0f;
+                if (inside)
+                {
+                    out.push_back(a.v);
+                    out.push_back(b.v);
+                    out.push_back(c.v);
+                    continue;
+                }
+                int count = 3;
+                polygon[0] = a, polygon[1] = b, polygon[2] = c;
+                for (int plane = 0; plane < 2 && count > 0; ++plane)
+                {
+                    int n = 0;
+                    for (int k = 0; k < count; ++k)
+                    {
+                        const Clipped &p = polygon[k], &q = polygon[(k + 1) % count];
+                        const float dp = plane == 0 ? nearDistance(p) : farDistance(p);
+                        const float dq = plane == 0 ? nearDistance(q) : farDistance(q);
+                        if (dp >= 0.0f)
+                            next[n++] = p;
+                        if ((dp >= 0.0f) != (dq >= 0.0f))
+                            next[n++] = lerp(p, q, dp / (dp - dq));
+                    }
+                    count = n;
+                    for (int k = 0; k < count; ++k)
+                        polygon[k] = next[k];
+                }
+                for (int k = 1; k + 1 < count; ++k)
+                {
+                    out.push_back(polygon[0].v);
+                    out.push_back(polygon[k].v);
+                    out.push_back(polygon[k + 1].v);
+                }
+            }
+            triangles.swap(out);
+        }
+
         // The visual's VU data (CreateVUdataFromMDT's layout) drawn with the packet's object-to-screen matrix.
         // The GS state a draw gets besides its VU data: DrawVu1's PRMODE (packet word 0x10: ABE always, TME unless
         // RenderInfo + 0x340, FGE for fog) and, for a CFrame's visual, the TEST / ZBUF / ALPHA that SetGsReg3
@@ -393,6 +479,8 @@ namespace dc::native
                 if (!vertices.empty())
                 {
                     if (drawn)
+                        clipDepth(clip, vertices);
+                    if (drawn && !vertices.empty())
                     {
                         renderer.draw(material, matrix, vertices.data(), static_cast<uint32_t>(vertices.size()));
                         g_stats.triangles += vertices.size() / 3u;
