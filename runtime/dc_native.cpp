@@ -26,6 +26,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -476,6 +477,12 @@ namespace dc::native
 
         std::unordered_map<uint32_t, std::pair<uint64_t, std::shared_ptr<const ps2x::native::TextureCache::Texture>>> g_decoded;
         uint64_t g_textureVersion = 0;
+        // DC_PROBE_HITCH=1 (diagnosis): what each frame decoded, to find the frames that take long.
+        struct FrameWork
+        {
+            uint32_t decodes = 0, storeDecodes = 0, patches = 0, draws = 0;
+            uint64_t decodedTexels = 0;
+        } g_frameWork;
 
         // The 8-bit textures converted offline from the user's disc (tools/dc_texconv.py: the TIM2 pictures of DC's IMG
         // archives, plain on the disc, which EnterTexture keeps in GS order in the game), keyed by name and the FNV-1a 32
@@ -593,6 +600,8 @@ namespace dc::native
             texture->width = 1u << tw;
             texture->height = 1u << th;
             texture->rgba.assign(static_cast<size_t>(texture->width) * texture->height, 0u);
+            ++g_frameWork.storeDecodes;
+            g_frameWork.decodedTexels += static_cast<uint64_t>(texture->width) * texture->height;
             const uint8_t *rgba = g_store.data() + stored->offset, *indices = rgba + 1024;
             uint32_t live[256];
             if (livePalette)
@@ -628,8 +637,25 @@ namespace dc::native
         // 8-bit texels are stored in GS memory order (flag + 0x4C: the game sends them as a CT32 image of half the
         // width) are not decoded here: by BaldHuman's rule no GS layout function runs in the game; they are to come
         // from an offline conversion of the disc's texture files, and draw untextured until then.
+        // Textures decoded when LoadTexture (0x154950 / 0x154770, the loading screens' pictures) sent them: it sends the
+        // pixels and palette at once from the file's buffer, which the next file then overwrites while the record still
+        // points there. Kept while the record keeps those pixels and TEX0.
+        struct Pinned
+        {
+            uint32_t pixels = 0;
+            uint64_t tex0 = 0;
+            std::shared_ptr<const ps2x::native::TextureCache::Texture> texture;
+        };
+        std::unordered_map<uint32_t, Pinned> g_pinned;
+
         std::shared_ptr<const ps2x::native::TextureCache::Texture> recordTexture(const uint8_t *rdram, uint32_t record)
         {
+            if (const auto pinned = g_pinned.find(record); pinned != g_pinned.end())
+            {
+                if (pinned->second.pixels == rd32(rdram, record + 0x38u) && pinned->second.tex0 == rd64(rdram, record + 0x28u))
+                    return pinned->second.texture;
+                g_pinned.erase(pinned);
+            }
             const uint32_t w = rd32(rdram, record) >> 16, h = rd32(rdram, record + 4u) & 0xFFFFu;
             const uint32_t kind = rd32(rdram, record + 4u) >> 16;
             const uint64_t tex0 = rd64(rdram, record + 0x28u);
@@ -681,6 +707,8 @@ namespace dc::native
             texture->rgba.assign(static_cast<size_t>(texture->width) * texture->height, 0u);
             texture->key = record;
             texture->version = ++g_textureVersion;
+            ++g_frameWork.decodes;
+            g_frameWork.decodedTexels += static_cast<uint64_t>(texture->width) * texture->height;
             const uint32_t rowTexels = tbw * 64u;
             const uint32_t bitsPerTexel = psm == 0x13u ? 8u : psm == 0x14u ? 4u : psm == 0x01u ? 24u : 32u;
             const uint32_t rows = bytes * 8u / (rowTexels * bitsPerTexel);
@@ -1757,6 +1785,7 @@ namespace dc::native
                         std::shared_ptr<const ps2x::native::TextureCache::Texture> texture = nullptr)
         {
             static const float kIdentity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+            ++g_frameWork.draws;
             if (!vertices.empty())
                 ps2x::native::Renderer::instance().draw(material, kIdentity, vertices.data(), static_cast<uint32_t>(vertices.size()),
                                                         std::move(texture));
@@ -1918,6 +1947,23 @@ namespace dc::native
                 std::fprintf(stderr, "[dc:2d]   draw %08x: (%.1f %.1f) (%.1f %.1f) uv (%.0f %.0f)-(%.0f %.0f) rgba %08x alpha %llx\n", record,
                              c[0].x, c[0].y, c[3].x, c[3].y, c[0].u, c[0].v, c[3].u, c[3].v, c[0].rgba,
                              static_cast<unsigned long long>(g_alpha2D));
+            // DC_PROBE_PALETTE=<name> (diagnosis): that record's pixels / palette pointers and first palette entries, once.
+            static const char *s_probePalette = std::getenv("DC_PROBE_PALETTE");
+            static bool s_paletteLogged = false;
+            if (s_probePalette && record != 0u && !s_paletteLogged &&
+                std::strncmp(reinterpret_cast<const char *>(rdram + ((record + 8u) & 0x1FFFFFFu)), s_probePalette, 32) == 0)
+            {
+                s_paletteLogged = true;
+                const uint32_t palette = rd32(rdram, record + 0x48u);
+                std::fprintf(stderr, "[dc:palette] %s record %08x pixels %08x palette %08x tex0 %016llx entries", s_probePalette, record,
+                             rd32(rdram, record + 0x38u), palette, static_cast<unsigned long long>(rd64(rdram, record + 0x28u)));
+                for (uint32_t k = 0; k < 8u; ++k)
+                    std::fprintf(stderr, " %08x", rd32(rdram, palette + k * 4u));
+                std::fprintf(stderr, " | pixels");
+                for (uint32_t k = 0; k < 8u; ++k)
+                    std::fprintf(stderr, " %02x", rdram[(rd32(rdram, record + 0x38u) + 64u * 128u + 64u + k) & 0x1FFFFFFu]);
+                std::fputc('\n', stderr);
+            }
             if (record != 0u && !texture)
                 return; // not decodable yet (counted with the GS-order textures not in the store)
             ps2x::native::Material material;
@@ -2331,6 +2377,8 @@ namespace dc::native
             if (!from || !to)
                 return;
             auto patched = std::make_shared<ps2x::native::TextureCache::Texture>(*to);
+            ++g_frameWork.patches;
+            g_frameWork.decodedTexels += static_cast<uint64_t>(patched->width) * patched->height;
             for (int32_t y = 0; y < r.h; ++y)
                 for (int32_t x = 0; x < r.w; ++x)
                 {
@@ -2658,11 +2706,46 @@ namespace dc::native
         // VSyncCallBack_Load (0x154320): while the game loads, its vsync callback draws the loading picture (the SCE and
         // Level-5 logos at boot) and shows it itself; the main loop, which publishes the native frame, is waiting. The
         // native frame built since the last one is published from there too.
+        // Only while the main loop is stalled (no frame of its own for 100 ms): the callback stays installed outside
+        // loading too, and a publish from it then cut the main loop's frame in two (a frame shown half built).
         PS2Runtime::RecompiledFunction g_vsyncLoad = nullptr;
+        std::atomic<int64_t> g_lastMainPublish{0}; // steady clock, ms
+        bool g_publishingFromLoad = false;
+        int64_t nowMs()
+        {
+            return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+        }
         void vsyncLoadHook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
         {
             g_vsyncLoad(rdram, ctx, runtime);
-            ::dc::native::publish();
+            if (nowMs() - g_lastMainPublish.load(std::memory_order_relaxed) > 100)
+            {
+                g_publishingFromLoad = true;
+                ::dc::native::publish();
+                g_publishingFromLoad = false;
+            }
+        }
+
+        PS2Runtime::RecompiledFunction g_loadTm2 = nullptr, g_loadTexture = nullptr;
+        void pinRecord(const uint8_t *rdram, uint32_t record)
+        {
+            g_pinned.erase(record);
+            g_decoded.erase(record);
+            if (auto texture = recordTexture(rdram, record))
+                g_pinned[record] = {rd32(rdram, record + 0x38u), rd64(rdram, record + 0x28u), texture};
+        }
+        // LoadTexture(TM2_head *, CTexture *, tbp, cbp) and LoadTexture(char *, u8 *, CTexture *, tbp, cbp).
+        void loadTm2Hook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+        {
+            const uint32_t record = getRegU32(ctx, 5);
+            g_loadTm2(rdram, ctx, runtime);
+            pinRecord(rdram, record);
+        }
+        void loadTextureHook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+        {
+            const uint32_t record = getRegU32(ctx, 6);
+            g_loadTexture(rdram, ctx, runtime);
+            pinRecord(rdram, record);
         }
 
         bool g_enabled = false;
@@ -2773,6 +2856,10 @@ namespace dc::native
                 runtime.registerFunction(0x0012F1A0u, &getBackTexHook);
             }
             runtime.registerFunction(0x0012F430u, &stretchMoveHook);
+            if ((g_loadTm2 = runtime.lookupFunction(0x00154950u)))
+                runtime.registerFunction(0x00154950u, &loadTm2Hook);
+            if ((g_loadTexture = runtime.lookupFunction(0x00154770u)))
+                runtime.registerFunction(0x00154770u, &loadTextureHook);
             if ((g_vsyncLoad = runtime.lookupFunction(0x00154320u)))
                 runtime.registerFunction(0x00154320u, &vsyncLoadHook);
             if ((g_drawFire = runtime.lookupFunction(0x00161AC0u)))
@@ -2851,6 +2938,27 @@ namespace dc::native
         renderer.endFrame();
         renderer.beginFrame(screen());
         g_clutOverride.clear();
+        if (!g_publishingFromLoad)
+            g_lastMainPublish.store(nowMs(), std::memory_order_relaxed);
+        static const bool s_probeHitch = std::getenv("DC_PROBE_HITCH") != nullptr;
+        if (s_probeHitch)
+        {
+            static auto s_last = std::chrono::steady_clock::now();
+            static double s_average = 16.7;
+            static int s_logged = 0;
+            const auto now = std::chrono::steady_clock::now();
+            const double ms = std::chrono::duration<double, std::milli>(now - s_last).count();
+            s_last = now;
+            if (ms > s_average * 1.6 && ms > 20.0 && s_logged < 400)
+            {
+                ++s_logged;
+                std::fprintf(stderr, "[dc:hitch] frame %u: %.1f ms (average %.1f): %u decodes, %u store decodes, %u patches, %llu texels, %u 2D draws\n",
+                             s_frames, ms, s_average, g_frameWork.decodes, g_frameWork.storeDecodes, g_frameWork.patches,
+                             static_cast<unsigned long long>(g_frameWork.decodedTexels), g_frameWork.draws);
+            }
+            s_average = s_average * 0.95 + std::min(ms, 50.0) * 0.05;
+        }
+        g_frameWork = FrameWork{};
     }
 
     // DC_PROBE_TEX=1 (diagnosis): the texture manager's (0x1C75870) records, every 600 frames: count at + 0, records
