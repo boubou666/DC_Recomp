@@ -135,6 +135,7 @@ scripts/build_tools.sh                                   # ps2_recomp, ps2_analy
 scripts/recomp.sh                                        # ELF + recomp/dc_scus97111.toml -> generated/
 scripts/overlays.sh                                      # TITLE.BIN, DUN.BIN -> generated/overlays/
 scripts/build_runtime.sh                                 # runtime + generated code -> build/game
+python3 tools/dc_texconv.py game build/textures/dc_textures.bin   # your disc's 8-bit textures, converted once
 scripts/run.sh                                           # ps2EntryRunner game/SCUS_971.11
 ```
 

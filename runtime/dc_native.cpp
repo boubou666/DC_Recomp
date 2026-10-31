@@ -30,6 +30,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <string>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
@@ -360,6 +362,100 @@ namespace dc::native
         std::unordered_map<uint32_t, std::pair<uint64_t, std::shared_ptr<const ps2x::native::TextureCache::Texture>>> g_decoded;
         uint64_t g_textureVersion = 0;
 
+        // The 8-bit textures converted offline from the user's disc (tools/dc_texconv.py: the TIM2 pictures of DC's IMG
+        // archives, plain on the disc, which EnterTexture keeps in GS order in the game), keyed by name and the FNV-1a 32
+        // of the palette as the disc holds it (EnterTexture copies it into the record as it is). DC_TEXTURES=<file>,
+        // default build/textures/dc_textures.bin.
+        struct StoredTexture
+        {
+            uint32_t width = 0, height = 0, offset = 0;
+        };
+        std::vector<uint8_t> g_store;
+        std::unordered_map<std::string, std::vector<StoredTexture>> g_storeIndex;
+        bool g_storeLoaded = false;
+
+        uint32_t fnv1a32(const uint8_t *rdram, uint32_t address, uint32_t bytes)
+        {
+            uint32_t hash = 0x811C9DC5u;
+            for (uint32_t i = 0; i < bytes; ++i)
+                hash = (hash ^ rdram[(address + i) & 0x1FFFFFFu]) * 0x01000193u;
+            return hash;
+        }
+
+        void loadStore()
+        {
+            g_storeLoaded = true;
+            const char *path = std::getenv("DC_TEXTURES");
+            std::ifstream file(path && *path ? path : "build/textures/dc_textures.bin", std::ios::binary);
+            if (!file)
+            {
+                std::fprintf(stderr, "[dc:native] no converted textures (run tools/dc_texconv.py game build/textures/dc_textures.bin): "
+                                     "8-bit textures draw untextured\n");
+                return;
+            }
+            g_store.assign(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
+            if (g_store.size() < 12u || std::memcmp(g_store.data(), "DCTX", 4) != 0)
+            {
+                g_store.clear();
+                return;
+            }
+            uint32_t count = 0;
+            std::memcpy(&count, g_store.data() + 8, 4);
+            for (uint32_t i = 0; i < count && 12u + (i + 1u) * 44u <= g_store.size(); ++i)
+            {
+                const uint8_t *entry = g_store.data() + 12u + i * 44u;
+                const std::string name(reinterpret_cast<const char *>(entry), strnlen(reinterpret_cast<const char *>(entry), 32));
+                uint16_t width = 0, height = 0;
+                uint32_t paletteHash = 0;
+                StoredTexture texture;
+                std::memcpy(&width, entry + 32, 2);
+                std::memcpy(&height, entry + 34, 2);
+                std::memcpy(&paletteHash, entry + 36, 4);
+                std::memcpy(&texture.offset, entry + 40, 4);
+                texture.width = width;
+                texture.height = height;
+                if (texture.offset + 1024u + texture.width * texture.height <= g_store.size())
+                    g_storeIndex[name + '|' + std::to_string(paletteHash)].push_back(texture);
+            }
+            std::fprintf(stderr, "[dc:native] %u converted 8-bit textures loaded\n", count);
+        }
+
+        // An 8-bit record's texture from the converted store: the record's name, its palette's hash and its size.
+        std::shared_ptr<ps2x::native::TextureCache::Texture> storedTexture(const uint8_t *rdram, uint32_t record,
+                                                                           uint32_t w, uint32_t h, uint32_t tw, uint32_t th)
+        {
+            if (!g_storeLoaded)
+                loadStore();
+            char name[33] = {};
+            for (uint32_t k = 0; k < 32u; ++k)
+                name[k] = static_cast<char>(rdram[(record + 8u + k) & 0x1FFFFFFu]);
+            const uint32_t palette = rd32(rdram, record + 0x48u);
+            if (palette == 0u)
+                return nullptr;
+            const auto found = g_storeIndex.find(std::string(name) + '|' + std::to_string(fnv1a32(rdram, palette, 1024u)));
+            if (found == g_storeIndex.end())
+                return nullptr;
+            const StoredTexture *stored = nullptr;
+            for (const StoredTexture &candidate : found->second)
+                if (candidate.width * candidate.height == w * h)
+                    stored = &candidate;
+            if (!stored)
+                return nullptr;
+            auto texture = std::make_shared<ps2x::native::TextureCache::Texture>();
+            texture->width = 1u << tw;
+            texture->height = 1u << th;
+            texture->rgba.assign(static_cast<size_t>(texture->width) * texture->height, 0u);
+            const uint8_t *rgba = g_store.data() + stored->offset, *indices = rgba + 1024;
+            for (uint32_t y = 0; y < stored->height && y < texture->height; ++y)
+                for (uint32_t x = 0; x < stored->width && x < texture->width; ++x)
+                {
+                    uint32_t texel = 0;
+                    std::memcpy(&texel, rgba + indices[y * stored->width + x] * 4u, 4);
+                    texture->rgba[static_cast<size_t>(y) * texture->width + x] = texel;
+                }
+            return texture;
+        }
+
         uint64_t contentHash(const uint8_t *rdram, uint32_t address, uint32_t bytes, uint64_t hash)
         {
             for (uint32_t i = 0; i + 4u <= bytes; i += 4u)
@@ -381,8 +477,22 @@ namespace dc::native
             const uint32_t palette = kind == 1u ? rd32(rdram, record + 0x48u) : 0u;
             if (kind == 1u && rd32(rdram, record + 0x4Cu) != 0u)
             {
-                ++g_stats.gsOrderTextures;
-                return nullptr;
+                // Kept in GS order by the game: from the offline conversion of the disc's pictures.
+                const uint32_t tw = (tex0 >> 26) & 0xFu, th = (tex0 >> 30) & 0xFu;
+                const uint64_t hash = 0x5354u ^ (static_cast<uint64_t>(rd32(rdram, record + 0x48u)) << 16) ^ tex0;
+                auto &slot = g_decoded[record];
+                if (slot.second && slot.first == hash)
+                    return slot.second;
+                auto texture = tw <= 10u && th <= 10u ? storedTexture(rdram, record, w, h, tw, th) : nullptr;
+                if (!texture)
+                {
+                    ++g_stats.gsOrderTextures;
+                    return nullptr;
+                }
+                texture->key = record;
+                texture->version = ++g_textureVersion;
+                slot = {hash, texture};
+                return texture;
             }
             const uint32_t bytes = (kind == 1u ? 1u : 4u) * w * h; // ReloadTexture's level 0: kind x w x h / 16 qwords
             const uint32_t tbw = std::max<uint32_t>((tex0 >> 14) & 0x3Fu, 1u);

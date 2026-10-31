@@ -214,3 +214,11 @@ from the ELF's own symbols.
   the disc's files, no GS layout function in the game. The runtime un-swizzle is removed. Those textures are about 97%
   of the model draws: the 3D is untextured until the offline converter (disc IMG files -> native images in the build
   tree, loaded by the record's name and size at the record hook) exists.
+- Offline texture conversion (2026-10-31): DC's pictures are TIM2 inside IMG archives (1,227 IMG blocks in DATA.DAT:
+  `.img` files and blocks embedded in `.chr`, `.pak`, `.pac`, `.pim`, `.mpd`), plain on the disc; EnterTexture
+  (0x1313B0) is what puts the 8-bit ones in GS order (Conv8to32). `tools/dc_texconv.py game
+  build/textures/dc_textures.bin` converts the 2,243 8-bit pictures (921 distinct, 80 MB, never committed) to a store
+  of RGBA palettes (CSM1 order resolved) and linear indices. At runtime an 8-bit record's texture comes from the store
+  by the record's name, its palette's hash (the palette EnterTexture copies into the record unchanged) and its size;
+  no GS layout function runs in the game. Every GS-order texture in the Norune run was found; the Colonel's face is
+  right for the first time in the native path.
