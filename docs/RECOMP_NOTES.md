@@ -195,3 +195,10 @@ from the ELF's own symbols.
   skipped programs), and the GS front end draws the 2D and composites.
 - The fps overlay (`PS2X_SHOW_FPS=1`, F3) showed 0.0 in scenes where DC's display buffer does not flip: the native
   frame end now reports DC's frames (`noteGameFrame`).
+- Other VU1 programs (2026-10-31): a 7-minute run (intro, title, name entry, Dark Shrine, cutscenes, Norune start)
+  with `DC_PROBE_VU1=1` draws 15,172,342 model primitives natively and VU1 skips 15,172,008 programs (the difference
+  is the last frame still in flight), every one at pc 0 or 8, the model programs' entries. So the "few hundred
+  non-model programs" counted earlier were a frame-boundary lag, and in the reachable part of the game every VU1
+  program is a DrawVu1 model. The other VU1 users in the code never ran there: CVisualShadow (shadows),
+  CCloth::DrawVu1 (0x13C470), CWater::DrawVu1 (0x160F20); CEffect::Draw runs in Norune (900-30,000 calls per 300
+  frames) without starting a VU1 program. They need a scripted run into gameplay (Toan's control, a dungeon) first.

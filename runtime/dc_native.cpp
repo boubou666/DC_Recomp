@@ -115,9 +115,13 @@ namespace dc::native
 
         // Every MSCAL VIF1 meets is skipped: VU1 runs no microcode. VIF1 numbers the programs it skips (1, 2, ...)
         // and the native batches carry the same numbers (renderer groups), so they sit where VU1's output would be.
-        bool gate(const uint8_t *, uint32_t)
+        std::atomic<uint64_t> g_gateByPc[4]{}; // diagnosis: skipped at pc 0, 8 (the models'), at another pc, the last other
+        bool gate(const uint8_t *, uint32_t pc)
         {
             g_gateSkipped.fetch_add(1u, std::memory_order_relaxed);
+            g_gateByPc[pc == 0u ? 0 : pc == 8u ? 1 : 2].fetch_add(1u, std::memory_order_relaxed);
+            if (pc != 0u && pc != 8u)
+                g_gateByPc[3].store(pc, std::memory_order_relaxed);
             return true;
         }
 
@@ -638,6 +642,33 @@ namespace dc::native
                 original(rdram, ctx, runtime);
         }
 
+        // DC_PROBE_VU1=1 (diagnosis): calls of the routines that may run VU1 programs other than the models'.
+        struct CountHook
+        {
+            uint32_t address;
+            const char *name;
+            PS2Runtime::RecompiledFunction original;
+            std::atomic<uint64_t> calls;
+        };
+        CountHook g_countHooks[] = {{0x0013C470u, "CCloth::DrawVu1", nullptr, {}},
+                                    {0x00160F20u, "CWater::DrawVu1", nullptr, {}},
+                                    {0x00164340u, "CEffect::Draw", nullptr, {}},
+                                    {0x00163480u, "CRunEffect::Draw", nullptr, {}},
+                                    {0x00163B20u, "CCandleEffect::Draw", nullptr, {}},
+                                    {0x0012BA20u, "CSpriteTable::DrawTable", nullptr, {}},
+                                    {0x00136290u, "CVisualShadow::DrawVu1", nullptr, {}},
+                                    {0x00129400u, "CFrameVu1::DrawVu1", nullptr, {}}};
+        void countHook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+        {
+            for (CountHook &hook : g_countHooks)
+                if (hook.address == ctx->pc)
+                {
+                    hook.calls.fetch_add(1u, std::memory_order_relaxed);
+                    hook.original(rdram, ctx, runtime);
+                    return;
+                }
+        }
+
         bool g_enabled = false;
     }
 
@@ -657,6 +688,10 @@ namespace dc::native
             for (SpriteHook &hook : g_spriteHooks)
                 if ((hook.original = runtime.lookupFunction(hook.address)))
                     runtime.registerFunction(hook.address, &spriteProbe);
+        if (const char *probe = std::getenv("DC_PROBE_VU1"); probe && probe[0] == '1')
+            for (CountHook &hook : g_countHooks)
+                if ((hook.original = runtime.lookupFunction(hook.address)))
+                    runtime.registerFunction(hook.address, &countHook);
         const char *on = std::getenv("DC_NATIVE3D");
         if (!(on && on[0] == '1'))
             return;
@@ -703,8 +738,15 @@ namespace dc::native
                          static_cast<unsigned long long>(g_stats.shadows),
                          static_cast<unsigned long long>(g_stats.screenSpace),
                          static_cast<unsigned long long>(g_gateSkipped.exchange(0)));
-            std::fprintf(stderr, "[dc:native] groups: %llu numbered here\n", static_cast<unsigned long long>(g_group));
+            std::fprintf(stderr, "[dc:native] groups: %llu numbered here; skipped at pc 0: %llu, pc 8: %llu, other: %llu (last 0x%llx)\n",
+                         static_cast<unsigned long long>(g_group), static_cast<unsigned long long>(g_gateByPc[0].exchange(0)),
+                         static_cast<unsigned long long>(g_gateByPc[1].exchange(0)),
+                         static_cast<unsigned long long>(g_gateByPc[2].exchange(0)),
+                         static_cast<unsigned long long>(g_gateByPc[3].load()));
             g_stats = Stats{};
+            for (CountHook &hook : g_countHooks)
+                if (const uint64_t calls = hook.calls.exchange(0))
+                    std::fprintf(stderr, "[dc:probe] %s: %llu calls\n", hook.name, static_cast<unsigned long long>(calls));
         }
         renderer.endFrame();
         renderer.beginFrame(screen());
