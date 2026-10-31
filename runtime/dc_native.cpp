@@ -305,6 +305,51 @@ namespace dc::native
         }
 
         // The visual's VU data (CreateVUdataFromMDT's layout) drawn with the packet's object-to-screen matrix.
+        // The GS state a draw gets besides its VU data: DrawVu1's PRMODE (packet word 0x10: ABE always, TME unless
+        // RenderInfo + 0x340, FGE for fog) and, for a CFrame's visual, the TEST / ZBUF / ALPHA that SetGsReg3
+        // (0x129360) puts just before the packet (alpha test reference, Z write off, translucency).
+        struct DrawState
+        {
+            uint32_t prmode = 0x58u;
+            bool hasRegs = false;
+            uint64_t test = 0, zbuf = 0, alpha = 0;
+        };
+
+        DrawState drawStateOf(const uint8_t *rdram, uint32_t packet)
+        {
+            DrawState state;
+            state.prmode = rd32(rdram, packet + 0x10u * 4u);
+            const uint32_t regs = packet - 0x60u; // SetGsReg3: DMA cnt, DIRECT 4, A+D tag, TEST_1, ZBUF_1, ALPHA_1
+            if (rd32(rdram, regs + 0x1Cu) == 0x50000004u && rd32(rdram, regs + 0x38u) == 0x47u &&
+                rd32(rdram, regs + 0x48u) == 0x4Eu && rd32(rdram, regs + 0x58u) == 0x42u)
+            {
+                state.hasRegs = true;
+                state.test = rd64(rdram, regs + 0x30u);
+                state.zbuf = rd64(rdram, regs + 0x40u);
+                state.alpha = rd64(rdram, regs + 0x50u);
+            }
+            return state;
+        }
+
+        void applyDrawState(const DrawState &state, ps2x::native::Material &material)
+        {
+            material.alphaBlend = (state.prmode & 0x40u) != 0u;
+            if (!state.hasRegs)
+                return;
+            material.blend = material.alphaBlend ? ps2x::native::blendOf(state.alpha) : ps2x::native::Material::Blend::Opaque;
+            material.depthWrite = ((state.zbuf >> 32) & 1u) == 0u;
+            // TEST: ATE, ATST (5 GEQUAL, 6 GREATER), AREF; a failing pixel kept out entirely (AFAIL KEEP) is a cut-out.
+            const uint32_t ate = state.test & 1u, atst = (state.test >> 1) & 7u, aref = (state.test >> 4) & 0xFFu;
+            const uint32_t afail = (state.test >> 12) & 3u;
+            material.alphaTest = false;
+            if (ate != 0u && afail == 0u && (atst == 5u || atst == 6u))
+            {
+                const uint32_t ref = atst == 5u ? (aref > 0u ? aref - 1u : 0u) : aref;
+                material.alphaTest = atst == 6u || aref > 0u;
+                material.alphaRef = static_cast<uint8_t>(std::min<uint32_t>(ref, 255u));
+            }
+        }
+
         void drawVisual(uint8_t *rdram, uint32_t visual, uint32_t packet, bool drawn, bool lit)
         {
             const uint32_t data = rd32(rdram, visual + 0x18u);
@@ -336,6 +381,9 @@ namespace dc::native
             material.blend = ps2x::native::Material::Blend::Alpha;
             material.depthTest = true;
             material.depthWrite = true;
+            const DrawState state = drawStateOf(rdram, packet);
+            applyDrawState(state, material);
+            const bool textureMapped = (state.prmode & 0x10u) != 0u;
             std::vector<ps2x::native::Vertex> vertices;
             ps2x::native::Renderer &renderer = ps2x::native::Renderer::instance();
             // The strips before an MSCAL / MSCNT are what that program draws.
@@ -369,7 +417,7 @@ namespace dc::native
                         if (reg == 0x06u)
                         {
                             material.tex0 = value;
-                            material.textured = true;
+                            material.textured = textureMapped;
                         }
                     }
                     q += 1u + n;
