@@ -1,30 +1,36 @@
-// Native PC rendering, Dark Cloud's adapter: DC's 3D models read from the game's own data and drawn by the fork's
-// native renderer (ps2x::native::Renderer), not by VU1 and the GS.
+// Native PC rendering, Dark Cloud's adapter: DC's 3D models drawn by the fork's native renderer
+// (ps2x::native::Renderer) from the game's own data, not by VU1 and the GS.
 //
-// DC draws every model piece with CVisualVu1::DrawVu1(packet, local-to-world matrix, RenderInfo *, VU1_PROGRAM, ...)
-// (0x135000; CVisualMDTVu1::DrawVu1 0x1360E0 and CFrameVu1::DrawVu1 0x129400 end there). It writes a VIF1 header
-// into the packet (the object-to-screen matrix at words 0x20-0x2F, lights, the GS PRMODE) and references the
-// visual's VU data, which CVisualVu1::CreateVUdataFromMDT (0x135AA0) built once from the model (MDT): per material a
-// DIRECT with TEX0 (and TEX1), an UNPACK of the material to VU 0x25, then per strip an UNPACK (TOPS-relative) of a GIF
-// tag, a (count, type, colour flag) quadword and the strip's positions, normals, texture coordinates and colours, one
-// array each (SetVuData 0x135970), closed by MSCAL / MSCNT. The microprogram transforms each position by the matrix,
-// divides by w and converts with FTOI4: the renderer's draw() does the same with gsZScale 16.
+// Nothing here reads a packet the game builds for the PS2 hardware (no VIF / GIF / GS data): every draw comes from
+// the game's own structures, as its EE code holds them.
+// - CVisualVu1::DrawVu1 (0x135000) is where DC draws a model piece: the visual, its local-to-world matrix (a2), its
+//   RenderInfo (a3: the camera's matrices, the lights, shadow and fog switches) and the VU1 program (t0).
+// - The geometry is the model's MDT, the data DC builds the piece's VU data from (CreateVUdataFromMDT 0x135AA0,
+//   CreateVUdataFromMDTRemake 0x135E50, hooked to note which MDT a visual is made of; CVisualMDTVu1 also keeps it at
+//   + 0x20): positions, normals, texture coordinates and colours, and a list of primitives (strip or triangle list,
+//   count, material) of index tuples into them.
+// - A material's texture is the CTextureManager record its name finds (as CreateVUdataFromMDT finds it), decoded from
+//   the record's own pixels and palette in main memory.
+// - An object's alpha test, Z write and translucency are the values CFrameVu1::DrawVu1 hands SetGsReg3 (0x129360).
+// - The transform, the lights and the texture coordinate scale are DrawVu1's own computation (its header) redone from
+//   RenderInfo; the lighting is the VU1 program's formula.
+// VU1 is told to skip every program (setVu1Gate): it runs no microcode. The native batches are numbered as the
+// programs VU1 skips (renderer groups), one per primitive, as CreateVUdataFromMDT starts one program per primitive.
 //
-// DC_NATIVE3D=1 turns it on. First step: geometry and textures, unlit; VU1 still draws (PS2X_NATIVE_VIEW=only shows
-// the native frame alone).
+// DC_NATIVE3D=1 turns it on.
 
 #include "ps2_runtime.h"
+#include "runtime/gs/ps2_gs_memory.h"
 #include "runtime/native/native_renderer.h"
 #include "runtime/native/native_vif1.h"
-#include "runtime/gs/ps2_gs_memory.h"
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <deque>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
@@ -34,16 +40,22 @@ namespace dc::native
 {
     namespace
     {
-        constexpr uint32_t kVisualDrawVu1 = 0x00135000u; // CVisualVu1::DrawVu1(uint *, float (*)[4], RenderInfo *, ...)
-        PS2Runtime::RecompiledFunction g_drawVu1 = nullptr;
+        constexpr uint32_t kVisualDrawVu1 = 0x00135000u;      // CVisualVu1::DrawVu1(uint *, float (*)[4], RenderInfo *, ...)
+        constexpr uint32_t kCreateFromMdt = 0x00135AA0u;      // CVisualVu1::CreateVUdataFromMDT(uint *, uint *, int)
+        constexpr uint32_t kCreateFromMdtRemake = 0x00135E50u; // CVisualVu1::CreateVUdataFromMDTRemake(uint *, uint *, int)
+        constexpr uint32_t kSetGsReg3 = 0x00129360u;          // SetGsReg3(uint *, ulong *TEST, ulong *ZBUF, ulong *ALPHA)
+        constexpr uint32_t kVtVisualMdtVu1 = 0x002A11A0u;     // __vt__13CVisualMDTVu1
+        constexpr uint32_t kTextureManager = 0x01C75870u;     // the CTextureManager every MDT material's texture is in
+        PS2Runtime::RecompiledFunction g_drawVu1 = nullptr, g_createFromMdt = nullptr, g_createFromMdtRemake = nullptr,
+                                       g_setGsReg3 = nullptr;
         uint64_t g_group = 0;
 
         struct Stats
         {
-            uint64_t calls = 0, empty = 0, noData = 0, visuals = 0, strips = 0, triangles = 0, skipped = 0;
-            uint64_t shadows = 0, screenSpace = 0; // DrawVu1 calls left to VU1: RenderInfo + 0x320 set, program 0xF
-            uint64_t programs[16] = {};             // DrawVu1 calls by VU1_PROGRAM
+            uint64_t calls = 0, noModel = 0, primitives = 0, triangles = 0, shadows = 0, screenSpace = 0;
+            uint64_t ownTextures = 0, noTexture = 0;
         } g_stats;
+        std::atomic<uint64_t> g_gateSkipped{0};
 
         uint32_t rd32(const uint8_t *rdram, uint32_t address)
         {
@@ -79,167 +91,138 @@ namespace dc::native
             return s;
         }
 
-        // Which VU1 programs this adapter draws, told from the VIF1 stream itself: DC starts nearly every microprogram
-        // at pc 0 with the same code image, so the code cannot tell a model from the rest. The observer reads each piece
-        // of a transfer on the VIF1 thread (up to each MSCAL / MSCNT, before VIF1 asks the gate) and notes whether it
-        // holds a model strip (an UNPACK of SetVuData's layout: a GIF tag whose upper word is 0x302E4000 (strip) or
-        // 0x302DC000 (list)), and the PRMODE of the latest DrawVu1 header (IIP clear: a shadow volume; FST: the
-        // screen-space program 0xF), which stay on VU1. The gate then skips exactly the MSCALs the hook drew, in the
-        // same order, so the renderer groups (1, 2, ...) match the VIF1 interpreter's numbering of skipped programs.
-        std::atomic<uint64_t> g_gateCalls{0}, g_gateSkipped{0}, g_pieces{0}, g_modelUnpacks{0}, g_unpacks6c{0},
-            g_gateWithModel{0};
-        std::atomic<uint32_t> g_lastTagHigh{0}, g_lastPrmode{0};
-        bool g_pieceHasModel = false; // strips of a model since the last MSCAL / MSCNT
-        uint64_t g_prmode = 0x48u;    // IIP + ABE, as DrawVu1 writes for a lit model
-        // One decision per MSCAL of the observed stream, in order (the observer sees each whole transfer before VIF1
-        // runs it; VIF1 asks the gate at each MSCAL in the same order).
-        std::mutex g_decisionsMutex;
-        std::deque<bool> g_decisions;
-
-        bool modelPrmode(uint64_t prmode)
+        // DC's matrices as its VU0 code keeps them: four columns of four floats. mul(a, b) = a x b (MulMatrix).
+        struct Matrix
         {
-            return (prmode & 0x8u) != 0u && (prmode & 0x100u) == 0u;
+            float m[16];
+        };
+        Matrix load(const uint8_t *rdram, uint32_t address)
+        {
+            Matrix out;
+            for (int i = 0; i < 16; ++i)
+                out.m[i] = rdf(rdram, address + static_cast<uint32_t>(i) * 4u);
+            return out;
+        }
+        Matrix mul(const Matrix &a, const Matrix &b)
+        {
+            Matrix out;
+            for (int c = 0; c < 4; ++c)
+                for (int r = 0; r < 4; ++r)
+                    out.m[c * 4 + r] = a.m[0 * 4 + r] * b.m[c * 4 + 0] + a.m[1 * 4 + r] * b.m[c * 4 + 1] +
+                                       a.m[2 * 4 + r] * b.m[c * 4 + 2] + a.m[3 * 4 + r] * b.m[3 + c * 4];
+            return out;
         }
 
-        void observe(const uint8_t *stream, size_t bytes)
+        // Every MSCAL VIF1 meets is skipped: VU1 runs no microcode. VIF1 numbers the programs it skips (1, 2, ...)
+        // and the native batches carry the same numbers (renderer groups), so they sit where VU1's output would be.
+        bool gate(const uint8_t *, uint32_t)
         {
-            g_pieces.fetch_add(1u, std::memory_order_relaxed);
-            const size_t words = bytes / 4u;
-            auto word = [&](size_t i) {
-                uint32_t value = 0;
-                std::memcpy(&value, stream + i * 4u, sizeof(value));
-                return value;
-            };
-            size_t i = 0;
-            while (i < words)
+            g_gateSkipped.fetch_add(1u, std::memory_order_relaxed);
+            return true;
+        }
+
+        // Which MDT each visual is made of, noted as the game builds its VU data from it.
+        std::mutex g_mdtMutex;
+        std::unordered_map<uint32_t, uint32_t> g_visualMdt;
+        void createFromMdtHook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+        {
             {
-                const uint32_t code = word(i);
-                const uint32_t cmd = (code >> 24) & 0x7Fu;
-                if (cmd == 0x50u || cmd == 0x51u) // DIRECT / DIRECTHL: a GIF packet
-                {
-                    const uint32_t qwords = (code & 0xFFFFu) ? (code & 0xFFFFu) : 0x10000u;
-                    // DrawVu1's header: an A+D GIF tag (PACKED, NREG 1, REGS 0xE) then (value, register) pairs;
-                    // PRMODE is register 0x1B.
-                    if (i + 4u < words)
-                    {
-                        const uint32_t tagLo = word(i + 1u), tagHi = word(i + 2u), regs = word(i + 3u);
-                        const uint32_t nloop = tagLo & 0x7FFFu, flg = (tagHi >> 26) & 3u, nreg = (tagHi >> 28) & 15u;
-                        if (flg == 0u && nreg == 1u && (regs & 0xFu) == 0xEu)
-                            for (uint32_t k = 1; k <= nloop && k < qwords && i + 1u + k * 4u + 3u < words; ++k)
-                            {
-                                const size_t at = i + 1u + k * 4u;
-                                if ((word(at + 2u) & 0xFFu) == 0x1Bu)
-                                    g_prmode = word(at);
-                            }
-                    }
-                    i += 1u + static_cast<size_t>(qwords) * 4u;
-                }
-                else if ((cmd & 0x60u) == 0x60u) // UNPACK
-                {
-                    const uint32_t num = ((code >> 16) & 0xFFu) ? ((code >> 16) & 0xFFu) : 256u;
-                    const uint32_t vn = (cmd >> 2) & 3u, vl = cmd & 3u;
-                    const uint32_t bits = num * (vn + 1u) * (32u >> vl);
-                    if (cmd == 0x6Cu && num >= 2u && i + 8u < words)
-                    {
-                        const uint32_t tagHigh = word(i + 2u);
-                        g_unpacks6c.fetch_add(1u, std::memory_order_relaxed);
-                        if ((code & 0x8000u) != 0u)
-                            g_lastTagHigh.store(tagHigh, std::memory_order_relaxed);
-                        if (tagHigh == 0x302E4000u || tagHigh == 0x302DC000u)
-                        {
-                            g_pieceHasModel = true;
-                            g_modelUnpacks.fetch_add(1u, std::memory_order_relaxed);
-                        }
-                    }
-                    i += 1u + (bits + 31u) / 32u;
-                }
-                else if (cmd == 0x4Au) // MPG
-                {
-                    const uint32_t num = ((code >> 16) & 0xFFu) ? ((code >> 16) & 0xFFu) : 256u;
-                    i += 1u + num * 2u;
-                }
-                else if (cmd == 0x14u || cmd == 0x15u) // MSCAL / MSCALF: VIF1 will ask the gate about this one
-                {
-                    const bool drawn = g_pieceHasModel && modelPrmode(g_prmode);
-                    {
-                        std::lock_guard<std::mutex> lock(g_decisionsMutex);
-                        if (g_decisions.size() > 65536u)
-                            g_decisions.clear();
-                        g_decisions.push_back(drawn);
-                    }
-                    g_pieceHasModel = false;
-                    i += 1u;
-                }
-                else if (cmd == 0x17u) // MSCNT: continues the run the last MSCAL started
-                {
-                    g_pieceHasModel = false;
-                    i += 1u;
-                }
-                else if (cmd == 0x20u) // STMASK
-                    i += 2u;
-                else if (cmd == 0x30u || cmd == 0x31u) // STROW / STCOL
-                    i += 5u;
-                else
-                    i += 1u;
+                std::lock_guard<std::mutex> lock(g_mdtMutex);
+                g_visualMdt[getRegU32(ctx, 4)] = getRegU32(ctx, 6);
+            }
+            g_createFromMdt(rdram, ctx, runtime);
+        }
+        void createFromMdtRemakeHook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+        {
+            {
+                std::lock_guard<std::mutex> lock(g_mdtMutex);
+                g_visualMdt[getRegU32(ctx, 4)] = getRegU32(ctx, 6);
+            }
+            g_createFromMdtRemake(rdram, ctx, runtime);
+        }
+        uint32_t mdtOf(const uint8_t *rdram, uint32_t visual)
+        {
+            if (rd32(rdram, visual + 8u) == kVtVisualMdtVu1 && rd32(rdram, visual + 0x20u) != 0u)
+                return rd32(rdram, visual + 0x20u);
+            std::lock_guard<std::mutex> lock(g_mdtMutex);
+            const auto it = g_visualMdt.find(visual);
+            return it == g_visualMdt.end() ? 0u : it->second;
+        }
+
+        // The object state CFrameVu1::DrawVu1 hands SetGsReg3 just before it draws its visual: TEST (alpha test
+        // reference), ZBUF (Z write) and ALPHA (translucency), the game's own values.
+        struct ObjectState
+        {
+            bool valid = false;
+            uint64_t test = 0, zbuf = 0, alpha = 0;
+        } g_objectState;
+        void setGsReg3Hook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+        {
+            g_objectState.valid = true;
+            g_objectState.test = rd64(rdram, getRegU32(ctx, 5));
+            g_objectState.zbuf = rd64(rdram, getRegU32(ctx, 6));
+            g_objectState.alpha = rd64(rdram, getRegU32(ctx, 7));
+            g_setGsReg3(rdram, ctx, runtime);
+        }
+
+        void applyObjectState(const ObjectState &state, ps2x::native::Material &material)
+        {
+            material.blend = ps2x::native::Material::Blend::Alpha;
+            material.depthWrite = true;
+            material.alphaTest = false;
+            if (!state.valid)
+                return;
+            material.blend = ps2x::native::blendOf(state.alpha);
+            material.depthWrite = ((state.zbuf >> 32) & 1u) == 0u;
+            // TEST: ATE, ATST (5 GEQUAL, 6 GREATER), AREF; a failing pixel kept out entirely (AFAIL KEEP) is a cut-out.
+            const uint32_t ate = state.test & 1u, atst = (state.test >> 1) & 7u, aref = (state.test >> 4) & 0xFFu;
+            const uint32_t afail = (state.test >> 12) & 3u;
+            if (ate != 0u && afail == 0u && (atst == 5u || atst == 6u))
+            {
+                const uint32_t ref = atst == 5u ? (aref > 0u ? aref - 1u : 0u) : aref;
+                material.alphaTest = atst == 6u || aref > 0u;
+                material.alphaRef = static_cast<uint8_t>(std::min<uint32_t>(ref, 255u));
             }
         }
 
-        bool gate(const uint8_t *code, uint32_t pc)
+        // The VU1 program's lighting (image 8c7dbae50f1ab651, its setup at pc 0x50; f256fcac190325a3 for the models):
+        // DrawVu1 puts RenderInfo's four light directions (+ 0x110..+ 0x130, one light per component) at VU 9-11 and
+        // the local-to-world matrix's first three columns, normalised, at VU 5-7; their products are the lights in the
+        // model's space (vf2-vf4). Per vertex, d = max(0, vf2 n.x + vf3 n.y + vf4 n.z) and the colour is ambient
+        // (+ 0x190) + the lights' colours (+ 0x150..+ 0x180) . d, each scaled by the material's first quadword (VU 37),
+        // kept to 254. Texture coordinates are scaled by + 0x1A0's x. A draw with its last argument set reuses the
+        // lights of the draw before (VU 9-21 keep them).
+        struct Lights
         {
-            (void)code;
-            (void)pc;
-            g_gateCalls.fetch_add(1u, std::memory_order_relaxed);
-            g_lastPrmode.store(static_cast<uint32_t>(g_prmode), std::memory_order_relaxed);
-            bool drawn = false;
-            {
-                std::lock_guard<std::mutex> lock(g_decisionsMutex);
-                if (!g_decisions.empty())
-                {
-                    drawn = g_decisions.front();
-                    g_decisions.pop_front();
-                    g_gateWithModel.fetch_add(1u, std::memory_order_relaxed);
-                }
-            }
-            if (drawn)
-                g_gateSkipped.fetch_add(1u, std::memory_order_relaxed);
-            return drawn;
-        }
+            float dirs[3][4]{};    // RenderInfo + 0x110, + 0x120, + 0x130
+            float colour[4][4]{};  // + 0x150..+ 0x180
+            float ambient[4]{};    // + 0x190
+            float uvScale = 1.0f;  // + 0x1A0 x
+        } g_lights;
 
-        // The microprogram's lighting (its setup at pc 0x50, image 8c7dbae50f1ab651): the header's VU 9-11 (RenderInfo
-        // + 0x110, four light directions in their columns) times VU 5-7 (the local-to-world matrix's rows, normalised)
-        // give the lights in the model's space (vf2-vf4); per vertex, d = max(0, vf2 n.x + vf3 n.y + vf4 n.z), one
-        // component per light, and the colour is vf9 (VU 17, ambient) + vf5-vf8 (VU 13-16, the lights' colours) . d,
-        // kept to 254 (MINI by vf14.y), then FTOI0. The model's main paths first multiply vf5-vf9 by the material's first
-        // quadword (VU 37, f256fcac190325a3 at 0xAD0 / 0xBF8). The texture coordinates are scaled by VU 18's x (vf30).
         struct Lighting
         {
-            bool lit = false;
-            float dir[3][4]{};   // vf2-vf4
-            float colour[4][4]{}; // vf5-vf8
-            float ambient[4]{};   // vf9
-            float uvScale = 1.0f; // vf30.x
-            float material[4] = {1.0f, 1.0f, 1.0f, 1.0f}; // VU 37 (the material's first quadword): scales vf5-vf9
+            float dir[3][4]{};
+            float colour[4][4]{};
+            float ambient[4]{};
+            float material[4] = {1.0f, 1.0f, 1.0f, 1.0f};
         };
 
-        Lighting lightingFrom(const uint8_t *rdram, uint32_t packet)
+        Lighting lightingFor(const Lights &lights, const Matrix &localToWorld)
         {
-            auto vu = [&](uint32_t address, int component) {
-                // The header unpacks at VU 0 from the packet's word 0x1C.
-                return rdf(rdram, packet + 0x1Cu * 4u + address * 16u + static_cast<uint32_t>(component) * 4u);
-            };
             Lighting l;
-            l.lit = true;
             for (int j = 0; j < 3; ++j)
+            {
+                const float *column = &localToWorld.m[j * 4];
+                const float length = std::sqrt(column[0] * column[0] + column[1] * column[1] + column[2] * column[2]);
+                const float inverse = length > 0.0f ? 1.0f / length : 0.0f;
                 for (int c = 0; c < 4; ++c)
-                    l.dir[j][c] = vu(9, c) * vu(5u + j, 0) + vu(10, c) * vu(5u + j, 1) + vu(11, c) * vu(5u + j, 2);
-            for (int k = 0; k < 4; ++k)
-                for (int c = 0; c < 4; ++c)
-                    l.colour[k][c] = vu(13u + k, c);
-            for (int c = 0; c < 4; ++c)
-                l.ambient[c] = vu(17, c);
-            l.uvScale = vu(18, 0);
-            if (!(l.uvScale > 0.0f && l.uvScale <= 16.0f))
-                l.uvScale = 1.0f;
+                    l.dir[j][c] = (lights.dirs[0][c] * column[0] + lights.dirs[1][c] * column[1] +
+                                   lights.dirs[2][c] * column[2]) *
+                                  inverse;
+            }
+            std::memcpy(l.colour, lights.colour, sizeof(l.colour));
+            std::memcpy(l.ambient, lights.ambient, sizeof(l.ambient));
             return l;
         }
 
@@ -261,59 +244,12 @@ namespace dc::native
             return rgba;
         }
 
-        // One strip's vertices as triangles (type 4: a strip, 3: a list).
-        void emitStrip(const uint8_t *rdram, uint32_t base, uint32_t count, uint32_t type, bool colours,
-                       const Lighting &lighting, std::vector<ps2x::native::Vertex> &out)
-        {
-            const uint32_t positions = base, normals = base + count * 16u, uvs = base + count * 32u;
-            const uint32_t colourArray = base + count * 48u;
-            auto vertex = [&](uint32_t i)
-            {
-                ps2x::native::Vertex v;
-                v.x = rdf(rdram, positions + i * 16u);
-                v.y = rdf(rdram, positions + i * 16u + 4u);
-                v.z = rdf(rdram, positions + i * 16u + 8u);
-                v.u = rdf(rdram, uvs + i * 16u) * lighting.uvScale;
-                v.v = rdf(rdram, uvs + i * 16u + 4u) * lighting.uvScale;
-                v.rgba = lighting.lit ? shade(lighting, rdf(rdram, normals + i * 16u), rdf(rdram, normals + i * 16u + 4u),
-                                              rdf(rdram, normals + i * 16u + 8u))
-                                      : 0x80808080u;
-                if (colours)
-                {
-                    // The colour array's encoding is not settled yet: the first step keeps the vertices grey.
-                    (void)colourArray;
-                }
-                return v;
-            };
-            if (type == 4u)
-            {
-                for (uint32_t i = 2; i < count; ++i)
-                {
-                    ps2x::native::Vertex a = vertex(i - 2), b = vertex(i - 1), c = vertex(i);
-                    if (i & 1u)
-                        std::swap(a, b);
-                    out.push_back(a);
-                    out.push_back(b);
-                    out.push_back(c);
-                }
-            }
-            else
-            {
-                for (uint32_t i = 0; i + 2 < count; i += 3)
-                {
-                    out.push_back(vertex(i));
-                    out.push_back(vertex(i + 1));
-                    out.push_back(vertex(i + 2));
-                }
-            }
-        }
-
-        // The microprogram clips each triangle to its clip box (CLIPW against VU 24-27, |x|, |y|, |z| <= w; the
-        // clipping routine at 0x1C38 of f256fcac190325a3) and draws what is inside. The renderer clamps depth instead
-        // of clipping it and keeps GS Z to 24 bits, so a wall right at the camera came out behind what stood past it:
-        // here triangles are clipped to the near and far planes (z = -w, z = w) in that clip space, the new vertices
-        // interpolated in the object's space (clip coordinates are linear in it). x and y are left to the GPU.
-        void clipDepth(const float clip[16], std::vector<ps2x::native::Vertex> &triangles)
+        // The microprogram clips each triangle to its clip box (CLIPW against the clip matrix, |x|, |y|, |z| <= w;
+        // the clipping routine at 0x1C38 of f256fcac190325a3) and draws what is inside. The renderer clamps depth
+        // instead of clipping it and keeps GS Z to 24 bits: here triangles are clipped to the near and far planes
+        // (z = -w, z = w) of that clip space, the new vertices interpolated in the object's space (clip coordinates
+        // are linear in it). x and y are left to the GPU.
+        void clipDepth(const Matrix &clip, std::vector<ps2x::native::Vertex> &triangles)
         {
             using ps2x::native::Vertex;
             struct Clipped
@@ -322,8 +258,8 @@ namespace dc::native
                 float z, w;
             };
             auto toClip = [&](const Vertex &v) {
-                const float z = clip[0 * 4 + 2] * v.x + clip[1 * 4 + 2] * v.y + clip[2 * 4 + 2] * v.z + clip[3 * 4 + 2];
-                const float w = clip[0 * 4 + 3] * v.x + clip[1 * 4 + 3] * v.y + clip[2 * 4 + 3] * v.z + clip[3 * 4 + 3];
+                const float z = clip.m[0 * 4 + 2] * v.x + clip.m[1 * 4 + 2] * v.y + clip.m[2 * 4 + 2] * v.z + clip.m[3 * 4 + 2];
+                const float w = clip.m[0 * 4 + 3] * v.x + clip.m[1 * 4 + 3] * v.y + clip.m[2 * 4 + 3] * v.z + clip.m[3 * 4 + 3];
                 return Clipped{v, z, w};
             };
             auto lerp = [](const Clipped &a, const Clipped &b, float t) {
@@ -394,71 +330,32 @@ namespace dc::native
             triangles.swap(out);
         }
 
-        // DC_PROBE_FACES=1 (diagnosis): the GS registers of characters' VU data (CFrame draws: TEX0, TEX1, CLAMP, ...),
-        // each distinct (register, value) logged once; their textures written as the native cache decodes them.
-        const bool g_probeFaces = [] { const char *v = std::getenv("DC_PROBE_FACES"); return v && v[0] == '1'; }();
-        std::mutex g_faceMutex;
-        std::vector<uint64_t> g_faceSeen, g_faceTex0s;
-        void noteFaceRegister(uint32_t reg, uint64_t value)
+        // A CTextureManager record (0x50 bytes from + 0x10F8): + 0 group, + 2 width, + 4 height, + 6 kind (1: 8-bit
+        // with a palette, 4: 32-bit), + 8 name, + 0x28 TEX0, + 0x38 the levels' pixels, + 0x48 the palette, + 0x4C
+        // set when its 8-bit texels are stored pre-swizzled and sent as a CT32 image of half the width.
+        // SearchTextureName (0x131180): from the last record down, a record whose name matches.
+        uint32_t textureRecord(const uint8_t *rdram, uint32_t name)
         {
-            std::lock_guard<std::mutex> lock(g_faceMutex);
-            const uint64_t key = value * 0x9E3779B97F4A7C15ull ^ reg;
-            if (std::find(g_faceSeen.begin(), g_faceSeen.end(), key) != g_faceSeen.end() || g_faceSeen.size() >= 400u)
-                return;
-            g_faceSeen.push_back(key);
-            std::fprintf(stderr, "[dc:faces] reg 0x%02x = %016llx\n", reg, static_cast<unsigned long long>(value));
-            if (reg == 0x06u)
-                g_faceTex0s.push_back(value);
-        }
-
-        // Textures from the game's own assets, not from GS uploads. DC keeps every texture in main memory, in its
-        // CTextureManager records (0x50 bytes from + 0x10F8: group, width, height, kind, TEX0 at + 0x28, the levels'
-        // pixels at + 0x38.., the palette at + 0x48, a "sent as 32-bit" flag at + 0x4C), and ReloadTexture (0x133070)
-        // sends a group of them to VRAM before the draws that use it, several groups taking turns in the same place.
-        // The hook notes, in the game's own order (the EE's, as it builds the frame), which record each TEX0 shows;
-        // a draw's texture is decoded from that record's pixels and palette.
-        struct GameTexture
-        {
-            uint32_t pixels = 0, palette = 0, bytes = 0;
-            bool sentAs32 = false; // 8-bit texels stored pre-swizzled, sent as a CT32 image of half the width
-        };
-        constexpr uint32_t kReloadTexture = 0x00133070u;
-        bool g_gameTextures = false;
-        PS2Runtime::RecompiledFunction g_reloadTexture = nullptr;
-        std::unordered_map<uint64_t, GameTexture> g_shownTextures; // by TEX0 (format, place, size, palette)
-        uint64_t textureKey(uint64_t tex0)
-        {
-            return tex0 & ~(7ull << 34) & ~(7ull << 61); // without TCC / TFX and CLD
-        }
-
-        void reloadTextureHook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
-        {
-            const uint32_t manager = getRegU32(ctx, 4);
-            const int32_t group = static_cast<int32_t>(getRegU32(ctx, 6));
-            g_reloadTexture(rdram, ctx, runtime);
-            if (group < 0 || group >= 0x48)
-                return;
-            const uint32_t count = rd32(rdram, manager);
-            for (uint32_t i = 1; i < count && i < 1024u; ++i)
+            const int32_t count = static_cast<int32_t>(rd32(rdram, kTextureManager));
+            for (int32_t i = std::min(count, 1023); i >= 0; --i)
             {
-                const uint32_t record = manager + 0x10F8u + i * 0x50u;
-                if (static_cast<int16_t>(rd32(rdram, record) & 0xFFFFu) != group)
-                    continue;
-                const uint32_t w = rd32(rdram, record) >> 16, h = rd32(rdram, record + 4u) & 0xFFFFu;
-                const uint32_t kind = rd32(rdram, record + 4u) >> 16;
-                const uint64_t tex0 = rd64(rdram, record + 0x28u);
-                GameTexture texture;
-                texture.pixels = rd32(rdram, record + 0x38u);
-                texture.palette = kind == 1u ? rd32(rdram, record + 0x48u) : 0u;
-                texture.sentAs32 = kind == 1u && rd32(rdram, record + 0x4Cu) != 0u;
-                texture.bytes = (kind == 1u ? 1u : 4u) * w * h; // ReloadTexture's level 0: kind x w x h / 16 qwords
-                if (texture.pixels != 0u && texture.bytes != 0u)
-                    g_shownTextures[textureKey(tex0)] = texture;
+                const uint32_t record = kTextureManager + 0x10F8u + static_cast<uint32_t>(i) * 0x50u;
+                uint32_t k = 0;
+                for (; k < 32u; ++k)
+                {
+                    const uint8_t a = rdram[(name + k) & 0x1FFFFFFu], b = rdram[(record + 8u + k) & 0x1FFFFFFu];
+                    if (a != b || a == 0u)
+                        break;
+                }
+                if (k < 32u && rdram[(name + k) & 0x1FFFFFFu] == 0u && rdram[(record + 8u + k) & 0x1FFFFFFu] == 0u &&
+                    rdram[(record + 8u) & 0x1FFFFFFu] != 0u)
+                    return record;
             }
+            return 0u;
         }
 
         std::vector<uint8_t> g_unswizzle; // a GS-layout scratch for assets stored pre-swizzled
-        std::unordered_map<uint64_t, std::pair<uint64_t, std::shared_ptr<const ps2x::native::TextureCache::Texture>>> g_decoded;
+        std::unordered_map<uint32_t, std::pair<uint64_t, std::shared_ptr<const ps2x::native::TextureCache::Texture>>> g_decoded;
         uint64_t g_textureVersion = 0;
 
         uint64_t contentHash(const uint8_t *rdram, uint32_t address, uint32_t bytes, uint64_t hash)
@@ -468,29 +365,30 @@ namespace dc::native
             return hash;
         }
 
-        // The texture TEX0 shows as the game drew it, from its asset; null when no record shows it (textures sent
-        // another way: drawn from the GS uploads as before).
-        std::shared_ptr<const ps2x::native::TextureCache::Texture> gameTexture(const uint8_t *rdram, uint64_t tex0)
+        // A record's texture, decoded from its pixels and palette in main memory (8-bit / 4-bit with a CT32 palette as
+        // the game sends it: CSM1 entry order, CSA; CT32). An identical asset keeps its decoded texture.
+        std::shared_ptr<const ps2x::native::TextureCache::Texture> recordTexture(const uint8_t *rdram, uint32_t record)
         {
-            const auto shown = g_shownTextures.find(textureKey(tex0));
-            if (shown == g_shownTextures.end())
-                return nullptr;
-            const GameTexture &asset = shown->second;
+            const uint32_t w = rd32(rdram, record) >> 16, h = rd32(rdram, record + 4u) & 0xFFFFu;
+            const uint32_t kind = rd32(rdram, record + 4u) >> 16;
+            const uint64_t tex0 = rd64(rdram, record + 0x28u);
+            const uint32_t pixels = rd32(rdram, record + 0x38u);
+            const uint32_t palette = kind == 1u ? rd32(rdram, record + 0x48u) : 0u;
+            const bool sentAs32 = kind == 1u && rd32(rdram, record + 0x4Cu) != 0u;
+            const uint32_t bytes = (kind == 1u ? 1u : 4u) * w * h; // ReloadTexture's level 0: kind x w x h / 16 qwords
             const uint32_t tbp = tex0 & 0x3FFFu, tbw = std::max<uint32_t>((tex0 >> 14) & 0x3Fu, 1u);
             const uint32_t psm = (tex0 >> 20) & 0x3Fu;
             const uint32_t tw = (tex0 >> 26) & 0xFu, th = (tex0 >> 30) & 0xFu;
             const uint32_t cpsm = (tex0 >> 51) & 0xFu, csa = (tex0 >> 56) & 0x1Fu;
-            if ((psm != 0x13u && psm != 0x14u && psm != 0x00u) || (psm != 0x00u && (cpsm != 0u || asset.palette == 0u)) ||
-                tw > 10u || th > 10u)
+            if (pixels == 0u || bytes == 0u || (psm != 0x13u && psm != 0x14u && psm != 0x00u) ||
+                (psm != 0x00u && (cpsm != 0u || palette == 0u)) || tw > 10u || th > 10u)
                 return nullptr;
-            // Decoded again only when the asset's texels or palette change (an identical one finds its texture).
-            const uint32_t sample = std::min<uint32_t>(asset.bytes, 4096u);
-            uint64_t hash = contentHash(rdram, asset.pixels, sample, 0xCBF29CE484222325ull);
-            hash = contentHash(rdram, asset.pixels + asset.bytes - sample, sample, hash ^ asset.pixels);
-            if (asset.palette != 0u)
-                hash = contentHash(rdram, asset.palette, 1024u, hash ^ asset.palette);
-            const uint64_t key = textureKey(tex0) ^ (static_cast<uint64_t>(asset.pixels) << 1);
-            auto &slot = g_decoded[key];
+            const uint32_t sample = std::min<uint32_t>(bytes, 4096u);
+            uint64_t hash = contentHash(rdram, pixels, sample, 0xCBF29CE484222325ull ^ tex0);
+            hash = contentHash(rdram, pixels + bytes - sample, sample, hash ^ pixels);
+            if (palette != 0u)
+                hash = contentHash(rdram, palette, 1024u, hash ^ palette);
+            auto &slot = g_decoded[record];
             if (slot.second && slot.first == hash)
                 return slot.second;
 
@@ -498,48 +396,46 @@ namespace dc::native
             texture->width = 1u << tw;
             texture->height = 1u << th;
             texture->rgba.assign(static_cast<size_t>(texture->width) * texture->height, 0u);
-            texture->key = key;
+            texture->key = record;
             texture->version = ++g_textureVersion;
             const uint32_t rowTexels = tbw * 64u;
             const uint32_t bitsPerTexel = psm == 0x13u ? 8u : psm == 0x14u ? 4u : 32u;
-            const uint32_t rows = asset.bytes * 8u / (rowTexels * bitsPerTexel);
+            const uint32_t rows = bytes * 8u / (rowTexels * bitsPerTexel);
             auto alpha = [](uint32_t a) { return a >= 0x80u ? 255u : a * 2u; };
             auto colour = [&](uint32_t c) { return (c & 0x00FFFFFFu) | alpha(c >> 24) << 24; };
-            // 8-bit texels sent as CT32 (half the width): laid out as the GS stores that image, read back as 8-bit.
+            // 8-bit texels stored for a CT32 send (half the width): laid out as that image is, read back as 8-bit.
             const uint32_t bw32 = std::max<uint32_t>(tbw / 2u, 1u), width32 = bw32 * 64u;
-            const uint32_t rows32 = asset.sentAs32 ? asset.bytes / (width32 * 4u) : 0u;
-            if (asset.sentAs32)
+            const uint32_t rows32 = sentAs32 ? bytes / (width32 * 4u) : 0u;
+            if (sentAs32)
             {
                 g_unswizzle.resize(4u * 1024u * 1024u);
                 for (uint32_t y = 0; y < rows32; ++y)
                     for (uint32_t x = 0; x < width32; ++x)
-                        GSMem::WriteCT32(g_unswizzle.data(), tbp, bw32, x, y, rd32(rdram, asset.pixels + (y * width32 + x) * 4u));
+                        GSMem::WriteCT32(g_unswizzle.data(), tbp, bw32, x, y, rd32(rdram, pixels + (y * width32 + x) * 4u));
             }
-            const uint32_t texelRows = asset.sentAs32 ? rows32 * 2u : rows;
+            const uint32_t texelRows = sentAs32 ? rows32 * 2u : rows;
             for (uint32_t y = 0; y < texture->height && y < texelRows; ++y)
                 for (uint32_t x = 0; x < texture->width && x < rowTexels; ++x)
                 {
                     uint32_t texel = 0;
                     if (psm == 0x00u)
-                        texel = colour(rd32(rdram, asset.pixels + (y * rowTexels + x) * 4u));
+                        texel = colour(rd32(rdram, pixels + (y * rowTexels + x) * 4u));
                     else
                     {
                         uint32_t index = 0;
-                        if (asset.sentAs32)
+                        if (sentAs32)
                             index = psm == 0x13u ? GSMem::ReadP8(g_unswizzle.data(), tbp, tbw, x, y)
                                                  : GSMem::ReadP4(g_unswizzle.data(), tbp, tbw, x, y);
                         else if (psm == 0x13u)
-                            index = rdram[(asset.pixels + y * rowTexels + x) & 0x1FFFFFFu];
+                            index = rdram[(pixels + y * rowTexels + x) & 0x1FFFFFFu];
                         else
                         {
                             const uint32_t at = y * rowTexels + x;
-                            index = (rdram[(asset.pixels + at / 2u) & 0x1FFFFFFu] >> ((at & 1u) * 4u)) & 0xFu;
+                            index = (rdram[(pixels + at / 2u) & 0x1FFFFFFu] >> ((at & 1u) * 4u)) & 0xFu;
                         }
-                        // The palette as the game sends it (a 16 x 16 CT32 image for 256 colours, which CSM1 reads with
-                        // entries 8-15 and 16-23 of each 32 swapped), and CSA's offset for 16 colours.
                         const uint32_t entry = psm == 0x13u ? (index & 0xE7u) | ((index & 0x08u) << 1) | ((index & 0x10u) >> 1)
                                                             : csa * 16u + index;
-                        texel = colour(rd32(rdram, asset.palette + entry * 4u));
+                        texel = colour(rd32(rdram, palette + entry * 4u));
                     }
                     texture->rgba[static_cast<size_t>(y) * texture->width + x] = texel;
                 }
@@ -547,251 +443,156 @@ namespace dc::native
             return texture;
         }
 
-        // The visual's VU data (CreateVUdataFromMDT's layout) drawn with the packet's object-to-screen matrix.
-        // The GS state a draw gets besides its VU data: DrawVu1's PRMODE (packet word 0x10: ABE always, TME unless
-        // RenderInfo + 0x340, FGE for fog) and, for a CFrame's visual, the TEST / ZBUF / ALPHA that SetGsReg3
-        // (0x129360) puts just before the packet (alpha test reference, Z write off, translucency).
-        struct DrawState
-        {
-            uint32_t prmode = 0x58u;
-            bool hasRegs = false;
-            uint64_t test = 0, zbuf = 0, alpha = 0;
-        };
+        // A material (0x60 bytes): its first quadword is the colour the lights and ambient are scaled by, its texture
+        // name is at + 0x34. Its record, found once per material.
+        std::unordered_map<uint32_t, uint32_t> g_materialRecord;
 
-        DrawState drawStateOf(const uint8_t *rdram, uint32_t packet)
+        // One model piece, from its MDT: + 0x10 positions, + 0x18 normals, + 0x20 colours (none when <= 0), + 0x28
+        // the primitives (count at + 8, from + 0x10: type (4 strip, 3 list), vertex count, material (-1: the one
+        // before), then per vertex the indices of its position, normal, texture coordinates and colour), + 0x30 texture
+        // coordinates (the positions when <= 0), + 0x38 the materials.
+        void drawModel(const uint8_t *rdram, uint32_t mdt, const Matrix &localToWorld, uint32_t renderInfo, bool drawn)
         {
-            DrawState state;
-            state.prmode = rd32(rdram, packet + 0x10u * 4u);
-            const uint32_t regs = packet - 0x60u; // SetGsReg3: DMA cnt, DIRECT 4, A+D tag, TEST_1, ZBUF_1, ALPHA_1
-            if (rd32(rdram, regs + 0x1Cu) == 0x50000004u && rd32(rdram, regs + 0x38u) == 0x47u &&
-                rd32(rdram, regs + 0x48u) == 0x4Eu && rd32(rdram, regs + 0x58u) == 0x42u)
-            {
-                state.hasRegs = true;
-                state.test = rd64(rdram, regs + 0x30u);
-                state.zbuf = rd64(rdram, regs + 0x40u);
-                state.alpha = rd64(rdram, regs + 0x50u);
-            }
-            return state;
-        }
+            const Matrix clip = mul(mul(load(rdram, renderInfo + 0x230u), load(rdram, renderInfo + 0x10u)), localToWorld);
+            const Matrix toScreen = mul(load(rdram, renderInfo + 0x270u), clip);
+            Lighting lighting = lightingFor(g_lights, localToWorld);
+            const float uvScale = g_lights.uvScale;
+            const bool textureMapped = rd32(rdram, renderInfo + 0x320u) == 0u && rd32(rdram, renderInfo + 0x340u) == 0u;
 
-        void applyDrawState(const DrawState &state, ps2x::native::Material &material)
-        {
-            material.alphaBlend = (state.prmode & 0x40u) != 0u;
-            if (!state.hasRegs)
-                return;
-            material.blend = material.alphaBlend ? ps2x::native::blendOf(state.alpha) : ps2x::native::Material::Blend::Opaque;
-            material.depthWrite = ((state.zbuf >> 32) & 1u) == 0u;
-            // TEST: ATE, ATST (5 GEQUAL, 6 GREATER), AREF; a failing pixel kept out entirely (AFAIL KEEP) is a cut-out.
-            const uint32_t ate = state.test & 1u, atst = (state.test >> 1) & 7u, aref = (state.test >> 4) & 0xFFu;
-            const uint32_t afail = (state.test >> 12) & 3u;
-            material.alphaTest = false;
-            if (ate != 0u && afail == 0u && (atst == 5u || atst == 6u))
-            {
-                const uint32_t ref = atst == 5u ? (aref > 0u ? aref - 1u : 0u) : aref;
-                material.alphaTest = atst == 6u || aref > 0u;
-                material.alphaRef = static_cast<uint8_t>(std::min<uint32_t>(ref, 255u));
-            }
-        }
+            const uint32_t positions = mdt + rd32(rdram, mdt + 0x10u), normals = mdt + rd32(rdram, mdt + 0x18u);
+            const int32_t colourOffset = static_cast<int32_t>(rd32(rdram, mdt + 0x20u));
+            const int32_t uvOffset = static_cast<int32_t>(rd32(rdram, mdt + 0x30u));
+            const uint32_t uvs = uvOffset > 0 ? mdt + static_cast<uint32_t>(uvOffset) : positions;
+            const uint32_t stride = colourOffset > 0 ? 4u : 3u;
+            const uint32_t materials = mdt + rd32(rdram, mdt + 0x38u);
+            const uint32_t list = mdt + rd32(rdram, mdt + 0x28u);
+            const uint32_t primitives = rd32(rdram, list + 8u);
 
-        void drawVisual(uint8_t *rdram, uint32_t visual, uint32_t packet, bool drawn, bool lit)
-        {
-            const uint32_t data = rd32(rdram, visual + 0x18u);
-            const uint32_t qwords = rd32(rdram, visual + 0x1Cu);
-            if (data == 0u || qwords == 0u || qwords > 0x40000u)
-            {
-                ++g_stats.noData;
-                return;
-            }
-            // The header the packet unpacks at VU 0 (its word 0x1C on): VU 24-27 hold RenderInfo's 0x230 x 0x10 x the
-            // local-to-world matrix (words 0x7C-0x8B, clip space: the microprogram's CLIP tests are on it) and VU 28-31
-            // RenderInfo's 0x270 matrix (words 0x8C-0x9B, clip to GS screen, applied before the divide by w).
-            float clip[16], viewport[16], matrix[16];
-            for (int i = 0; i < 16; ++i)
-            {
-                clip[i] = rdf(rdram, packet + 0x7Cu * 4u + static_cast<uint32_t>(i) * 4u);
-                viewport[i] = rdf(rdram, packet + 0x8Cu * 4u + static_cast<uint32_t>(i) * 4u);
-            }
-            for (int c = 0; c < 4; ++c) // column c of viewport x clip
-                for (int r = 0; r < 4; ++r)
-                    matrix[c * 4 + r] = viewport[0 * 4 + r] * clip[c * 4 + 0] + viewport[1 * 4 + r] * clip[c * 4 + 1] +
-                                        viewport[2 * 4 + r] * clip[c * 4 + 2] + viewport[3 * 4 + r] * clip[c * 4 + 3];
-
-            Lighting lighting;
-            if (lit)
-                lighting = lightingFrom(rdram, packet);
             ps2x::native::Material material;
             material.textured = false;
-            material.blend = ps2x::native::Material::Blend::Alpha;
             material.depthTest = true;
-            material.depthWrite = true;
-            const DrawState state = drawStateOf(rdram, packet);
-            applyDrawState(state, material);
-            const bool textureMapped = (state.prmode & 0x10u) != 0u;
-            std::vector<ps2x::native::Vertex> vertices;
+            applyObjectState(g_objectState, material);
+            std::shared_ptr<const ps2x::native::TextureCache::Texture> texture;
             ps2x::native::Renderer &renderer = ps2x::native::Renderer::instance();
-            // The strips before an MSCAL / MSCNT are what that program draws.
-            auto flush = [&]
-            {
-                if (!vertices.empty())
-                {
-                    if (drawn)
-                        clipDepth(clip, vertices);
-                    if (drawn && !vertices.empty())
-                    {
-                        auto own = material.textured && g_gameTextures ? gameTexture(rdram, material.tex0) : nullptr;
-                        if (own)
-                            renderer.draw(material, matrix, vertices.data(), static_cast<uint32_t>(vertices.size()), own);
-                        else
-                            renderer.draw(material, matrix, vertices.data(), static_cast<uint32_t>(vertices.size()));
-                        g_stats.triangles += vertices.size() / 3u;
-                    }
-                    vertices.clear();
-                }
-            };
+            std::vector<ps2x::native::Vertex> vertices;
 
-            uint32_t q = 0;
-            while (q < qwords)
+            uint32_t at = list + 0x10u;
+            for (uint32_t p = 0; p < primitives && p < 4096u; ++p)
             {
-                const uint32_t at = data + q * 16u;
-                const uint32_t code = rd32(rdram, at + 12u);
-                const uint32_t cmd = (code >> 24) & 0x7Fu;
-                if (cmd == 0x50u) // DIRECT n: a GIF A+D packet (TEX0, TEX1)
+                const uint32_t type = rd32(rdram, at), count = rd32(rdram, at + 4u);
+                const int32_t materialIndex = static_cast<int32_t>(rd32(rdram, at + 8u));
+                const uint32_t indices = at + 12u;
+                at = indices + count * stride * 4u;
+                if (materialIndex >= 0)
                 {
-                    const uint32_t n = code & 0xFFFFu;
-                    for (uint32_t k = 2; k <= n; ++k) // after the GIF tag: (value, register) pairs
-                    {
-                        const uint32_t pair = at + k * 16u;
-                        const uint64_t value = rd64(rdram, pair);
-                        const uint32_t reg = rd32(rdram, pair + 8u) & 0xFFu;
-                        if (reg == 0x06u)
-                        {
-                            material.tex0 = value;
-                            material.textured = textureMapped;
-                        }
-                        if (g_probeFaces && state.hasRegs && drawn)
-                            noteFaceRegister(reg, value);
-                    }
-                    q += 1u + n;
+                    const uint32_t mat = materials + static_cast<uint32_t>(materialIndex) * 0x60u;
+                    for (int c = 0; c < 4; ++c)
+                        lighting.material[c] = rdf(rdram, mat + static_cast<uint32_t>(c) * 4u);
+                    auto found = g_materialRecord.find(mat);
+                    const uint32_t record = found != g_materialRecord.end() ? found->second
+                                                                            : (g_materialRecord[mat] = textureRecord(rdram, mat + 0x34u));
+                    texture = record != 0u ? recordTexture(rdram, record) : nullptr;
+                    material.tex0 = record != 0u ? rd64(rdram, record + 0x28u) : 0u;
                 }
-                else if ((cmd & 0x60u) == 0x60u) // UNPACK
-                {
-                    const uint32_t num = (code >> 16) & 0xFFu;
-                    const bool tops = (code & 0x8000u) != 0u;
-                    // The material (SetMaterial: UNPACK to VU 0x25): its first quadword scales the lights and ambient
-                    // (the microprogram's MUL of vf5-vf9 by VU 37).
-                    if (!tops && (code & 0x3FFu) == 0x25u && num >= 1u)
-                        for (int c = 0; c < 4; ++c)
-                            lighting.material[c] = rdf(rdram, at + 16u + static_cast<uint32_t>(c) * 4u);
-                    if (tops && num >= 2u)
+                if (count == 0u || count > 65536u)
+                    continue;
+                // Each primitive is a program run of its own on VU1 (an MSCAL): the renderer group VIF1 skips there.
+                renderer.beginGroup(++g_group);
+                if (!drawn)
+                    continue;
+                ++g_stats.primitives;
+                auto vertex = [&](uint32_t i) {
+                    const uint32_t tuple = indices + i * stride * 4u;
+                    const uint32_t pi = rd32(rdram, tuple), ni = rd32(rdram, tuple + 4u), ti = rd32(rdram, tuple + 8u);
+                    ps2x::native::Vertex v;
+                    v.x = rdf(rdram, positions + pi * 16u);
+                    v.y = rdf(rdram, positions + pi * 16u + 4u);
+                    v.z = rdf(rdram, positions + pi * 16u + 8u);
+                    v.u = rdf(rdram, uvs + ti * 16u) * uvScale;
+                    v.v = rdf(rdram, uvs + ti * 16u + 4u) * uvScale;
+                    v.rgba = shade(lighting, rdf(rdram, normals + ni * 16u), rdf(rdram, normals + ni * 16u + 4u),
+                                   rdf(rdram, normals + ni * 16u + 8u));
+                    return v;
+                };
+                vertices.clear();
+                if (type == 4u)
+                    for (uint32_t i = 2; i < count; ++i)
                     {
-                        const uint32_t header = at + 16u;
-                        const uint32_t count = rd32(rdram, header + 16u);
-                        const uint32_t type = rd32(rdram, header + 20u);
-                        const bool colours = rd32(rdram, header + 24u) != 0u;
-                        if (count > 0u && count <= 64u && (type == 3u || type == 4u))
-                        {
-                            emitStrip(rdram, header + 32u, count, type, colours, lighting, vertices);
-                            ++g_stats.strips;
-                        }
-                        else
-                        {
-                            ++g_stats.skipped;
-                        }
+                        ps2x::native::Vertex a = vertex(i - 2), b = vertex(i - 1), c = vertex(i);
+                        if (i & 1u)
+                            std::swap(a, b);
+                        vertices.push_back(a);
+                        vertices.push_back(b);
+                        vertices.push_back(c);
                     }
-                    q += 1u + num;
+                else
+                    for (uint32_t i = 0; i + 2 < count; i += 3)
+                    {
+                        vertices.push_back(vertex(i));
+                        vertices.push_back(vertex(i + 1));
+                        vertices.push_back(vertex(i + 2));
+                    }
+                clipDepth(clip, vertices);
+                if (vertices.empty())
+                    continue;
+                material.textured = textureMapped && texture != nullptr;
+                g_stats.triangles += vertices.size() / 3u;
+                if (material.textured)
+                {
+                    ++g_stats.ownTextures;
+                    renderer.draw(material, toScreen.m, vertices.data(), static_cast<uint32_t>(vertices.size()), texture);
                 }
                 else
                 {
-                    if (cmd == 0x14u || cmd == 0x15u) // MSCAL / MSCALF: a new program run, a new group
-                    {
-                        if (drawn)
-                            renderer.beginGroup(++g_group);
-                        flush();
-                    }
-                    else if (cmd == 0x17u) // MSCNT: the same run goes on
-                    {
-                        flush();
-                    }
-                    q += 1u;
+                    g_stats.noTexture += textureMapped ? 1u : 0u;
+                    renderer.draw(material, toScreen.m, vertices.data(), static_cast<uint32_t>(vertices.size()));
                 }
             }
-            flush();
-            ++g_stats.visuals;
         }
 
         void drawVu1Hook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
         {
-            const uint32_t visual = getRegU32(ctx, 4), packet = getRegU32(ctx, 5);
+            const uint32_t visual = getRegU32(ctx, 4), localToWorld = getRegU32(ctx, 6);
             const uint32_t renderInfo = getRegU32(ctx, 7), program = getRegU32(ctx, 8);
-            // DrawVu1's last argument set: no lights in the header (VU 9-21 keep the previous ones).
-            const bool lit = getRegU32(ctx, 11) == 0u;
+            const bool newLights = getRegU32(ctx, 11) == 0u; // DrawVu1's last argument: 0 sends RenderInfo's lights
             ++g_stats.calls;
+            // The game still builds its packet (the GS stream keeps its place: the renderer groups); nothing reads it.
             g_drawVu1(rdram, ctx, runtime);
-            // Shadow volumes (RenderInfo + 0x320) and screen-space programs (0xF, FST) stay on VU1 for now.
+            const ObjectState state = g_objectState;
+            g_objectState.valid = false;
+            if (rd32(rdram, visual + 0x18u) == 0u || rd32(rdram, visual + 0x1Cu) == 0u)
+                return; // DrawVu1 drew nothing (no VU data)
+            if (newLights)
+            {
+                for (int j = 0; j < 3; ++j)
+                    for (int c = 0; c < 4; ++c)
+                        g_lights.dirs[j][c] = rdf(rdram, renderInfo + 0x110u + static_cast<uint32_t>(j) * 16u + static_cast<uint32_t>(c) * 4u);
+                for (int k = 0; k < 4; ++k)
+                    for (int c = 0; c < 4; ++c)
+                        g_lights.colour[k][c] = rdf(rdram, renderInfo + 0x150u + static_cast<uint32_t>(k) * 16u + static_cast<uint32_t>(c) * 4u);
+                for (int c = 0; c < 4; ++c)
+                    g_lights.ambient[c] = rdf(rdram, renderInfo + 0x190u + static_cast<uint32_t>(c) * 4u);
+                g_lights.uvScale = rdf(rdram, renderInfo + 0x1A0u);
+                if (!(g_lights.uvScale > 0.0f && g_lights.uvScale <= 16.0f))
+                    g_lights.uvScale = 1.0f;
+            }
+            // Shadow volumes (RenderInfo + 0x320) and the screen-space program (0xF) are not drawn yet.
             const bool shadow = rd32(rdram, renderInfo + 0x320u) != 0u, screenSpace = program == 0xFu;
-            const bool drawn = !shadow && !screenSpace;
             g_stats.shadows += shadow ? 1u : 0u;
             g_stats.screenSpace += screenSpace ? 1u : 0u;
-            ++g_stats.programs[program & 0xFu];
-            if (getRegU32(ctx, 2) != 0u)
-                drawVisual(rdram, visual, packet, drawn, lit);
-            else
-                ++g_stats.empty;
-        }
-
-        // DC_PROBE_TEX=1 (diagnosis): each caller of sceVif1PkAddGsAD that writes a TEX0 with an 8- or 4-bit PSM, once.
-        constexpr uint32_t kPkAddGsAD = 0x00121028u;
-        PS2Runtime::RecompiledFunction g_addGsAD = nullptr;
-        void addGsADProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
-        {
-            const uint32_t reg = getRegU32(ctx, 5);
-            const uint64_t value = static_cast<uint64_t>(_mm_cvtsi128_si64(ctx->r[6]));
-            const uint32_t psm = static_cast<uint32_t>(value >> 20) & 0x3Fu;
-            const bool frame = (reg == 0x4Cu || reg == 0x4Du) &&
-                               ((static_cast<uint32_t>(value >> 24) & 0x3Fu) != 0u ||
-                                ((value & 0x1FFu) != 0u && (value & 0x1FFu) != 210u));
-            if (frame || (reg == 6u || reg == 7u) && (psm == 0x13u || psm == 0x14u || psm == 0x1Bu || psm == 0x24u || psm == 0x2Cu))
+            const uint32_t mdt = mdtOf(rdram, visual);
+            if (mdt == 0u)
             {
-                static std::mutex s_mutex;
-                static std::vector<uint32_t> s_seen;
-                const uint32_t ra = getRegU32(ctx, 31);
-                std::lock_guard<std::mutex> lock(s_mutex);
-                if (std::find(s_seen.begin(), s_seen.end(), ra) == s_seen.end() && s_seen.size() < 64u)
-                {
-                    s_seen.push_back(ra);
-                    if (frame)
-                        std::fprintf(stderr, "[dc:probe] FRAME fbp %u fbw %u psm 0x%x from ra 0x%08x\n",
-                                     static_cast<uint32_t>(value & 0x1FFu), static_cast<uint32_t>(value >> 16) & 0x3Fu,
-                                     static_cast<uint32_t>(value >> 24) & 0x3Fu, ra);
-                    else
-                        std::fprintf(stderr, "[dc:probe] TEX0 psm 0x%x tbp 0x%x tbw %u cbp 0x%x from ra 0x%08x\n", psm,
-                                     static_cast<uint32_t>(value & 0x3FFFu), static_cast<uint32_t>(value >> 14) & 0x3Fu,
-                                     static_cast<uint32_t>(value >> 37) & 0x3FFFu, ra);
-                }
+                ++g_stats.noModel;
+                return;
             }
-            g_addGsAD(rdram, ctx, runtime);
+            g_objectState = state;
+            drawModel(rdram, mdt, load(rdram, localToWorld), renderInfo, !shadow && !screenSpace);
+            g_objectState.valid = false;
         }
 
-        // DC_PROBE_TEX=1: MGMoveImage(src TEX0 *, rect *, dst TEX0 *, dx, dy, dir) (0x12F210), its first calls.
-        PS2Runtime::RecompiledFunction g_moveImage = nullptr;
-        void moveImageProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
-        {
-            static std::atomic<uint32_t> s_logged{0};
-            if (s_logged.fetch_add(1u) < 40u)
-            {
-                const uint32_t rect = getRegU32(ctx, 5);
-                std::fprintf(stderr, "[dc:probe] MGMoveImage src %016llx rect %d,%d %dx%d dst %016llx at %u,%u ra 0x%08x\n",
-                             static_cast<unsigned long long>(rd64(rdram, getRegU32(ctx, 4))),
-                             static_cast<int>(rd32(rdram, rect)), static_cast<int>(rd32(rdram, rect + 4u)),
-                             static_cast<int>(rd32(rdram, rect + 8u)), static_cast<int>(rd32(rdram, rect + 12u)),
-                             static_cast<unsigned long long>(rd64(rdram, getRegU32(ctx, 6))), getRegU32(ctx, 7),
-                             getRegU32(ctx, 8), getRegU32(ctx, 31));
-            }
-            g_moveImage(rdram, ctx, runtime);
-        }
-
-        // DC_PROBE_TEX=1: DC's 2D sprite functions (packet, CTexture *, const CRect &dst, ...): each (caller, texture)
-        // that covers most of the screen (dst at least 512 wide), once.
+        // DC_PROBE_TEX=1 (diagnosis): DC's 2D sprite functions (packet, CTexture *, const CRect &dst, ...): each
+        // (caller, texture) that covers most of the screen (dst at least 512 wide), once.
         struct SpriteHook
         {
             uint32_t address;
@@ -807,9 +608,6 @@ namespace dc::native
             for (const SpriteHook &hook : g_spriteHooks)
                 if (hook.address == pc)
                     original = hook.original;
-            static std::atomic<bool> s_first{true};
-            if (s_first.exchange(false))
-                std::fprintf(stderr, "[dc:probe] sprite hooks called (first 0x%06x)\n", pc);
             const uint32_t texture = getRegU32(ctx, 5), rect = getRegU32(ctx, 6);
             const int32_t width = static_cast<int32_t>(rd32(rdram, rect + 8u));
             if (texture != 0u && width >= 512)
@@ -840,38 +638,6 @@ namespace dc::native
                 original(rdram, ctx, runtime);
         }
 
-        // DC_PROBE_TEX=1: ClsMes::MakeFukidashi_sub (0x150F50): the balloon's fields (+0x38 type, +0x3C..+0x50 window
-        // corners and size, +0x58 tail flag, +0x78 / +0x80 / +0x88 tail points, +0x90 opening), every 120th call.
-        PS2Runtime::RecompiledFunction g_fukidashiSub = nullptr;
-        void fukidashiProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
-        {
-            static std::atomic<uint32_t> s_calls{0};
-            if (s_calls.fetch_add(1u) % 120u == 0u)
-            {
-                const uint32_t mes = getRegU32(ctx, 4);
-                std::fprintf(stderr, "[dc:probe] fukidashi:");
-                for (uint32_t off = 0x38u; off <= 0x8Cu; off += 4u)
-                    std::fprintf(stderr, " %02x=%d", off, static_cast<int32_t>(rd32(rdram, mes + off)));
-                std::fprintf(stderr, " 90=%.3f\n", rdf(rdram, mes + 0x90u));
-            }
-            g_fukidashiSub(rdram, ctx, runtime);
-        }
-
-        // DC_PROBE_TEX=1: RollPos(float angle, float *centre, float *point, float *out) (0x14C690), its first calls.
-        PS2Runtime::RecompiledFunction g_rollPos = nullptr;
-        void rollPosProbe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
-        {
-            static std::atomic<uint32_t> s_logged{0};
-            const uint32_t centre = getRegU32(ctx, 4), point = getRegU32(ctx, 5), out = getRegU32(ctx, 6);
-            const float angle = ctx->f[12];
-            const float cx = rdf(rdram, centre), cy = rdf(rdram, centre + 4u), px = rdf(rdram, point),
-                        py = rdf(rdram, point + 4u);
-            g_rollPos(rdram, ctx, runtime);
-            if (s_logged.fetch_add(1u) < 24u)
-                std::fprintf(stderr, "[dc:probe] RollPos angle %.4f centre %.1f,%.1f point %.1f,%.1f -> %.1f,%.1f\n", angle,
-                             cx, cy, px, py, rdf(rdram, out), rdf(rdram, out + 4u));
-        }
-
         bool g_enabled = false;
     }
 
@@ -888,50 +654,33 @@ namespace dc::native
                 ctx->pc = getRegU32(ctx, 31);
             });
         if (const char *probe = std::getenv("DC_PROBE_TEX"); probe && probe[0] == '1')
-        {
-            if ((g_addGsAD = runtime.lookupFunction(kPkAddGsAD)))
-                runtime.registerFunction(kPkAddGsAD, &addGsADProbe);
-            if ((g_moveImage = runtime.lookupFunction(0x0012F210u)))
-                runtime.registerFunction(0x0012F210u, &moveImageProbe);
-            if ((g_rollPos = runtime.lookupFunction(0x0014C690u)))
-                runtime.registerFunction(0x0014C690u, &rollPosProbe);
-            if ((g_fukidashiSub = runtime.lookupFunction(0x00150F50u)))
-                runtime.registerFunction(0x00150F50u, &fukidashiProbe);
             for (SpriteHook &hook : g_spriteHooks)
                 if ((hook.original = runtime.lookupFunction(hook.address)))
                     runtime.registerFunction(hook.address, &spriteProbe);
-        }
         const char *on = std::getenv("DC_NATIVE3D");
         if (!(on && on[0] == '1'))
             return;
         g_drawVu1 = runtime.lookupFunction(kVisualDrawVu1);
-        if (!g_drawVu1)
+        g_createFromMdt = runtime.lookupFunction(kCreateFromMdt);
+        g_createFromMdtRemake = runtime.lookupFunction(kCreateFromMdtRemake);
+        g_setGsReg3 = runtime.lookupFunction(kSetGsReg3);
+        if (!g_drawVu1 || !g_createFromMdt || !g_createFromMdtRemake || !g_setGsReg3)
         {
-            std::fprintf(stderr, "[dc:native] CVisualVu1::DrawVu1 not found\n");
+            std::fprintf(stderr, "[dc:native] a hooked function is missing\n");
             return;
         }
         runtime.registerFunction(kVisualDrawVu1, &drawVu1Hook);
-        // DC_GAME_TEXTURES=0: the models' textures from the GS uploads, as before (to compare).
-        if (const char *own = std::getenv("DC_GAME_TEXTURES"); !(own && own[0] == '0'))
-            if ((g_reloadTexture = runtime.lookupFunction(kReloadTexture)))
-            {
-                runtime.registerFunction(kReloadTexture, &reloadTextureHook);
-                g_gameTextures = true;
-            }
+        runtime.registerFunction(kCreateFromMdt, &createFromMdtHook);
+        runtime.registerFunction(kCreateFromMdtRemake, &createFromMdtRemakeHook);
+        runtime.registerFunction(kSetGsReg3, &setGsReg3Hook);
         ps2x::native::Renderer &renderer = ps2x::native::Renderer::instance();
         renderer.setEnabled(true);
         renderer.beginFrame(screen());
-        // DC_NATIVE3D_VU1=1 keeps VU1 drawing them too (to compare with PS2X_NATIVE_VIEW=only).
-        if (const char *keep = std::getenv("DC_NATIVE3D_VU1"); !(keep && keep[0] == '1'))
-        {
-            ps2x::native::setVif1Observer(&observe);
-            ps2x::native::setVu1Gate(&gate);
-            // In the GS stream where VU1's output would have been: after the textures the same chain uploads, sorted
-            // with the GS draws around it.
-            renderer.setStreamDraws(true);
-        }
+        ps2x::native::setVu1Gate(&gate);
+        // In the GS stream where VU1's output would have been, sorted with the GS draws around it.
+        renderer.setStreamDraws(true);
         g_enabled = true;
-        std::fprintf(stderr, "[dc:native] 3D models drawn natively from the game's VU data (lit as the microprogram lights them)\n");
+        std::fprintf(stderr, "[dc:native] 3D models drawn natively from the game's MDT models, RenderInfo and textures; VU1 runs nothing\n");
     }
 
     // At the game's frame end (dc_overrides.cpp's native frame end): publishes the frame built and starts the next.
@@ -943,81 +692,37 @@ namespace dc::native
         static uint32_t s_frames = 0;
         if (++s_frames % 300u == 0u)
         {
-            std::fprintf(stderr, "[dc:native] per 300 frames: %llu calls (%llu empty, %llu without data), %llu visuals, "
-                                 "%llu strips, %llu triangles, %llu skipped; left to VU1: %llu shadows, %llu screen-space\n",
-                         static_cast<unsigned long long>(g_stats.calls), static_cast<unsigned long long>(g_stats.empty),
-                         static_cast<unsigned long long>(g_stats.noData),
-                         static_cast<unsigned long long>(g_stats.visuals), static_cast<unsigned long long>(g_stats.strips),
-                         static_cast<unsigned long long>(g_stats.triangles), static_cast<unsigned long long>(g_stats.skipped),
-                         static_cast<unsigned long long>(g_stats.shadows), static_cast<unsigned long long>(g_stats.screenSpace));
-            std::fprintf(stderr, "[dc:native] gate: %llu MSCALs, %llu with a decision, %llu drawn here; observer: "
-                                 "%llu pieces, %llu V4-32 unpacks, %llu model strips; last TOPS tag 0x%08x, last PRMODE 0x%x\n",
-                         static_cast<unsigned long long>(g_gateCalls.exchange(0)),
-                         static_cast<unsigned long long>(g_gateWithModel.exchange(0)),
-                         static_cast<unsigned long long>(g_gateSkipped.exchange(0)),
-                         static_cast<unsigned long long>(g_pieces.exchange(0)),
-                         static_cast<unsigned long long>(g_unpacks6c.exchange(0)),
-                         static_cast<unsigned long long>(g_modelUnpacks.exchange(0)), g_lastTagHigh.load(),
-                         g_lastPrmode.load());
-            std::fprintf(stderr, "[dc:native] DrawVu1 by program:");
-            for (int p = 0; p < 16; ++p)
-                if (g_stats.programs[p] != 0u)
-                    std::fprintf(stderr, " %d:%llu", p, static_cast<unsigned long long>(g_stats.programs[p]));
-            std::fprintf(stderr, "\n");
+            std::fprintf(stderr, "[dc:native] per 300 frames: %llu DrawVu1 calls (%llu without a known MDT), %llu primitives, "
+                                 "%llu triangles, %llu own textures, %llu untextured for lack of one; not drawn: %llu shadows, "
+                                 "%llu screen-space; VU1 programs skipped: %llu\n",
+                         static_cast<unsigned long long>(g_stats.calls), static_cast<unsigned long long>(g_stats.noModel),
+                         static_cast<unsigned long long>(g_stats.primitives),
+                         static_cast<unsigned long long>(g_stats.triangles),
+                         static_cast<unsigned long long>(g_stats.ownTextures),
+                         static_cast<unsigned long long>(g_stats.noTexture),
+                         static_cast<unsigned long long>(g_stats.shadows),
+                         static_cast<unsigned long long>(g_stats.screenSpace),
+                         static_cast<unsigned long long>(g_gateSkipped.exchange(0)));
+            std::fprintf(stderr, "[dc:native] groups: %llu numbered here\n", static_cast<unsigned long long>(g_group));
             g_stats = Stats{};
         }
         renderer.endFrame();
         renderer.beginFrame(screen());
     }
 
-    // DC_PROBE_TEX=1 (diagnosis): the texture manager's (0x1C75870) textures, every 600 frames: count at +0, entries
-    // of 0x50 bytes from +0x10F8, each with its TEX0 at +0x28.
+    // DC_PROBE_TEX=1 (diagnosis): the texture manager's (0x1C75870) records, every 600 frames: count at + 0, records
+    // of 0x50 bytes from + 0x10F8, each with its name at + 8 and TEX0 at + 0x28.
     void probeTextures(const uint8_t *rdram)
     {
-        // DC_PROBE_FACES=1: every 600 frames, the characters' textures noted since, as the native cache decodes them
-        // (PPM files in PS2X_CAPTURE_DIR).
-        if (g_probeFaces)
-        {
-            static uint32_t s_faceFrames = 0;
-            if (++s_faceFrames % 600u == 0u)
-            {
-                std::vector<uint64_t> tex0s;
-                {
-                    std::lock_guard<std::mutex> lock(g_faceMutex);
-                    tex0s.swap(g_faceTex0s);
-                }
-                const char *dir = std::getenv("PS2X_CAPTURE_DIR");
-                for (const uint64_t tex0 : tex0s)
-                {
-                    auto texture = ps2x::native::Renderer::instance().textures().texture(tex0);
-                    if (!texture || texture->width == 0u)
-                        continue;
-                    char path[1024];
-                    std::snprintf(path, sizeof(path), "%s/face_%016llx.ppm", dir && *dir ? dir : ".",
-                                  static_cast<unsigned long long>(tex0));
-                    if (FILE *f = std::fopen(path, "wb"))
-                    {
-                        std::fprintf(f, "P6\n%u %u\n255\n", texture->width, texture->height);
-                        for (const uint32_t px : texture->rgba)
-                        {
-                            const uint8_t rgb[3] = {static_cast<uint8_t>(px), static_cast<uint8_t>(px >> 8),
-                                                    static_cast<uint8_t>(px >> 16)};
-                            std::fwrite(rgb, 1, 3, f);
-                        }
-                        std::fclose(f);
-                    }
-                }
-            }
-        }
         static const bool on = [] { const char *v = std::getenv("DC_PROBE_TEX"); return v && v[0] == '1'; }();
         static uint32_t s_frames = 0;
         if (!on || ++s_frames % 600u != 0u)
             return;
-        const uint32_t manager = 0x01C75870u, count = rd32(rdram, manager);
+        const uint32_t count = rd32(rdram, kTextureManager);
         std::fprintf(stderr, "[dc:probe] frame %u: %u textures\n", s_frames, count);
         for (uint32_t i = 0; i < count && i < 512u; ++i)
         {
-            const uint32_t entry = manager + 0x10F8u + i * 0x50u;
+            const uint32_t entry = kTextureManager + 0x10F8u + i * 0x50u;
             const uint64_t tex0 = rd64(rdram, entry + 0x28u);
             char name[33] = {};
             for (uint32_t k = 0; k < 32u; ++k)

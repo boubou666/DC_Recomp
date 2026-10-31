@@ -43,6 +43,7 @@ namespace
     {
         const uint32_t ra = getRegU32(ctx, 31);
         g_frames.fetch_add(1u, std::memory_order_relaxed);
+        runtime->noteGameFrame(); // the fps overlay (PS2X_SHOW_FPS / F3): DC's display buffer does not flip in every scene
         dc::native::publish();
         dc::native::probeTextures(rdram);
         static auto s_next = std::chrono::steady_clock::now();

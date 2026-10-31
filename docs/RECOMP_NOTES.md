@@ -183,3 +183,15 @@ from the ELF's own symbols.
   ReloadTexture record) fall back to the native texture cache, which is fed from GS uploads (GS-side: to replace by
   hooking those routines too); one character in front of a pillar mostly missing (depth or alpha, not texture).
   VP2S agreed on f2f that their GS-side texture store is not compliant and moved VP2 to the same EE-side approach.
+- No packets read (2026-10-31, BaldHuman's rule as TMB applies it: no reading of GIF / VIF packets, not even those
+  the game just built in EE RAM). `runtime/dc_native.cpp` rewritten: each DrawVu1 draws from the visual's MDT
+  (noted by hooking CreateVUdataFromMDT / ...Remake; CVisualMDTVu1 keeps it at + 0x20), with clip = RenderInfo
+  0x230 x 0x10 x the local-to-world matrix and RenderInfo 0x270 to the screen, RenderInfo's lights (+ 0x110..+ 0x1A0),
+  the object's TEST / ZBUF / ALPHA from SetGsReg3's arguments, each material's texture from the texture record its
+  name finds (as CreateVUdataFromMDT finds it), decoded from main memory. The VIF1 observer is gone: VU1 skips every
+  program. Over 300 frames: ~278k primitives drawn, ~278.7k programs skipped; the few hundred skipped programs that
+  are not DrawVu1 models (other VU1 users) are not drawn yet. Still present and still to remove: the game builds its
+  packets anyway (nothing reads them; the renderer's groups take their place in the GS stream from VIF1's count of
+  skipped programs), and the GS front end draws the 2D and composites.
+- The fps overlay (`PS2X_SHOW_FPS=1`, F3) showed 0.0 in scenes where DC's display buffer does not flip: the native
+  frame end now reports DC's frames (`noteGameFrame`).

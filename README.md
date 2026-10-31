@@ -30,8 +30,9 @@ shows the title screen and its attract demo, and New game plays the opening in t
 Colonel Flag, the Dark Genie) at 56-60 fps with music. The goal, as for the other ports of the fork, is no PS2
 emulation at all; paraLLEl-GS is never used. Native today: the game's code and overlays (recompiled), its IOP modules
 (recompiled), the frame loop and sound on the PC clock, and, with `DC_NATIVE3D=1`, its 3D models: the adapter
-(`runtime/dc_native.cpp`) reads each model's own data (strips, normals, materials, lights) where the game draws it and
-draws it with the PC GPU, lit as the game's VU1 program lights it, and VU1 skips those programs.
+(`runtime/dc_native.cpp`) draws each model piece from the game's own data (its MDT model, RenderInfo's camera and
+lights, the object's state, its texture decoded from the game's texture records in main memory), never from a packet
+built for the PS2 hardware, lit as the game's VU1 program lights it; VU1 runs no microcode.
 
 **Still emulated, and being removed:**
 
