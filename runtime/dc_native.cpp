@@ -40,6 +40,7 @@
 
 namespace dc::native
 {
+    void publish(); // the game frame's end: below
     namespace
     {
         constexpr uint32_t kVisualDrawVu1 = 0x00135000u;      // CVisualVu1::DrawVu1(uint *, float (*)[4], RenderInfo *, ...)
@@ -55,7 +56,7 @@ namespace dc::native
         struct Stats
         {
             uint64_t calls = 0, noModel = 0, primitives = 0, triangles = 0, shadows = 0, screenSpace = 0;
-            uint64_t ownTextures = 0, noTexture = 0, gsOrderTextures = 0, cloths = 0, shadowTriangles = 0, waters = 0, staleModel = 0, mdtDiffers = 0, noZWrite = 0, copiedModel = 0, depthOfFields = 0, culled = 0, zPast24 = 0, zNegative = 0, guarded = 0, textureCopies = 0, textureCopiesMissed = 0;
+            uint64_t ownTextures = 0, noTexture = 0, gsOrderTextures = 0, cloths = 0, shadowTriangles = 0, waters = 0, staleModel = 0, mdtDiffers = 0, noZWrite = 0, copiedModel = 0, depthOfFields = 0, culled = 0, zPast24 = 0, zNegative = 0, guarded = 0, textureCopies = 0, textureCopiesMissed = 0, stretches = 0, stretchesMissed = 0, madeDraws[9] = {}, clears = 0, lastClear = 0;
             double maxZ = -1e30, minZ = 1e30;
         } g_stats;
         std::atomic<uint64_t> g_gateSkipped{0};
@@ -653,13 +654,15 @@ namespace dc::native
                 slot = {hash, texture};
                 return texture;
             }
-            const uint32_t bytes = (kind == 1u ? 1u : 4u) * w * h; // ReloadTexture's level 0: kind x w x h / 16 qwords
+            // ReloadTexture's level 0: kind x w x h / 16 qwords; the kind is the bytes per texel (1: 8-bit with a palette,
+            // 3: 24-bit, 4: 32-bit).
+            const uint32_t bytes = (kind == 1u ? 1u : kind == 3u ? 3u : 4u) * w * h;
             const uint32_t tbw = std::max<uint32_t>((tex0 >> 14) & 0x3Fu, 1u);
             const uint32_t psm = (tex0 >> 20) & 0x3Fu;
             const uint32_t tw = (tex0 >> 26) & 0xFu, th = (tex0 >> 30) & 0xFu;
             const uint32_t cpsm = (tex0 >> 51) & 0xFu, csa = (tex0 >> 56) & 0x1Fu;
-            if (pixels == 0u || bytes == 0u || (psm != 0x13u && psm != 0x14u && psm != 0x00u) ||
-                (psm != 0x00u && (cpsm != 0u || palette == 0u)) || tw > 10u || th > 10u)
+            if (pixels == 0u || bytes == 0u || (psm != 0x13u && psm != 0x14u && psm != 0x00u && psm != 0x01u) ||
+                (psm != 0x00u && psm != 0x01u && (cpsm != 0u || palette == 0u)) || tw > 10u || th > 10u)
                 return nullptr;
             // Up to 256 KiB hashed whole (the game rewrites some in place: the message windows' glyphs), larger ones sampled.
             const uint32_t sample = bytes <= 0x40000u ? bytes : 4096u;
@@ -679,7 +682,7 @@ namespace dc::native
             texture->key = record;
             texture->version = ++g_textureVersion;
             const uint32_t rowTexels = tbw * 64u;
-            const uint32_t bitsPerTexel = psm == 0x13u ? 8u : psm == 0x14u ? 4u : 32u;
+            const uint32_t bitsPerTexel = psm == 0x13u ? 8u : psm == 0x14u ? 4u : psm == 0x01u ? 24u : 32u;
             const uint32_t rows = bytes * 8u / (rowTexels * bitsPerTexel);
             auto alpha = [](uint32_t a) { return a >= 0x80u ? 255u : a * 2u; };
             auto colour = [&](uint32_t c) { return (c & 0x00FFFFFFu) | alpha(c >> 24) << 24; };
@@ -689,6 +692,12 @@ namespace dc::native
                     uint32_t texel = 0;
                     if (psm == 0x00u)
                         texel = colour(rd32(rdram, pixels + (y * rowTexels + x) * 4u));
+                    else if (psm == 0x01u)
+                    {
+                        // 24-bit (the title's backdrop "bg"): RGB as stored, opaque.
+                        const uint32_t at = pixels + (y * rowTexels + x) * 3u;
+                        texel = rdram[at & 0x1FFFFFFu] | rdram[(at + 1u) & 0x1FFFFFFu] << 8 | rdram[(at + 2u) & 0x1FFFFFFu] << 16 | 0xFF000000u;
+                    }
                     else
                     {
                         uint32_t index = 0;
@@ -979,7 +988,17 @@ namespace dc::native
             const uint32_t mdt = m.mdt;
             DrawSetup setup = drawSetup(rdram, localToWorld, renderInfo);
             setup.cull = (rd32(rdram, renderInfo + 0x310u) & 4u) != 0u;
-            setup.fog = rd32(rdram, renderInfo + 0x324u) != 0u && rd32(rdram, renderInfo + 0x320u) == 0u;
+            static const bool s_noFog = std::getenv("DC_NO_FOG") != nullptr; // diagnosis
+            setup.fog = !s_noFog && rd32(rdram, renderInfo + 0x324u) != 0u && rd32(rdram, renderInfo + 0x320u) == 0u;
+            // DC_PROBE_FOG=1 (diagnosis): the fog of the first RenderInfos seen.
+            static int s_fogLogged = 0;
+            if (std::getenv("DC_PROBE_FOG") && s_fogLogged < 12 && setup.fog)
+            {
+                ++s_fogLogged;
+                std::fprintf(stderr, "[dc:fog] RenderInfo %08x colour %06x base %g scale %g range %g..%g\n", renderInfo,
+                             rd32(rdram, renderInfo + 0x338u) & 0xFFFFFFu, rdf(rdram, renderInfo + 0x328u), rdf(rdram, renderInfo + 0x32Cu),
+                             rdf(rdram, renderInfo + 0x330u), rdf(rdram, renderInfo + 0x334u));
+            }
             setup.fogColour = rd32(rdram, renderInfo + 0x338u) & 0xFFFFFFu;
             setup.fogBase = rdf(rdram, renderInfo + 0x328u);
             setup.fogMax = rdf(rdram, renderInfo + 0x334u);
@@ -1027,6 +1046,22 @@ namespace dc::native
                     const uint32_t record = m.records && p < m.records->size() ? (*m.records)[p] : modelMaterialRecord(rdram, m, mat);
                     texture = record != 0u ? recordTexture(rdram, record) : nullptr;
                     material.tex0 = record != 0u ? rd64(rdram, record + 0x28u) : 0u;
+                    // DC_PROBE_UNTEX=1 (diagnosis): each record a model primitive cannot be textured with, once.
+                    static const bool s_probeUntex = std::getenv("DC_PROBE_UNTEX") != nullptr;
+                    static std::unordered_map<uint32_t, bool> s_untex;
+                    if (s_probeUntex && !texture && !s_untex[record])
+                    {
+                        s_untex[record] = true;
+                        char name[33] = {};
+                        for (uint32_t k = 0; record != 0u && k < 32u; ++k)
+                            name[k] = static_cast<char>(rdram[(record + 8u + k) & 0x1FFFFFFu]);
+                        const uint64_t tex0 = record != 0u ? rd64(rdram, record + 0x28u) : 0u;
+                        std::fprintf(stderr, "[dc:untex] record %08x \"%s\" kind %u psm 0x%x %ux%u flag %u pixels %08x palette %08x\n", record,
+                                     name, record != 0u ? rd32(rdram, record + 4u) >> 16 : 0u, static_cast<unsigned>((tex0 >> 20) & 0x3Fu),
+                                     record != 0u ? rd32(rdram, record) >> 16 : 0u, record != 0u ? rd32(rdram, record + 4u) & 0xFFFFu : 0u,
+                                     record != 0u ? rd32(rdram, record + 0x4Cu) : 0u, record != 0u ? rd32(rdram, record + 0x38u) : 0u,
+                                     record != 0u ? rd32(rdram, record + 0x48u) : 0u);
+                    }
                 }
                 if (count == 0u || count > 65536u)
                     continue;
@@ -1740,6 +1775,8 @@ namespace dc::native
             std::vector<ps2x::native::Vertex> vertices;
             quad(vertices, kOriginX, kOriginY, kOriginX + 640.0f, kOriginY + 224.0f, 0.0f,
                  flatColour(getRegU32(ctx, 4), getRegU32(ctx, 5), getRegU32(ctx, 6), getRegU32(ctx, 7)));
+            ++g_stats.clears;
+            g_stats.lastClear = (getRegU32(ctx, 4) & 0xFFu) << 16 | (getRegU32(ctx, 5) & 0xFFu) << 8 | (getRegU32(ctx, 6) & 0xFFu);
             drawScreen(material, vertices);
         }
         // MGClearZBuffer (0x12FD30, a0 the Z): the same sprite with ALPHA 0x6A (Cd: the colour kept), Z written.
@@ -1792,18 +1829,55 @@ namespace dc::native
         {
             return rd32(rdram, getRegU32(ctx, 29) + index * 8u);
         }
-        // Textures the game draws into (its frame pointed at them), each an offscreen target of the renderer: the message
-        // balloons' (0x299A78, target 1). A sprite of that record samples the target.
-        uint32_t g_balloonRecord = 0;
+        // Pictures the game makes itself instead of loading them, each kept by the renderer, keyed by the place the game
+        // gives them (TEX0's base): its frame and the frame before (MGGetFBuffTex / MGGetFBuffBackTex), and the work
+        // textures it draws into (the balloons' 0x299A78, the title's trail) as offscreen targets. A sprite whose
+        // texture is one of them samples it.
+        uint32_t g_frameBase = ~0u, g_backBase = ~0u;
+        bool g_backAsked = false; // the getter the game called last (DC reports one base for both: the last one decides)
+        std::unordered_map<uint32_t, uint8_t> g_targetOfBase;
+        uint8_t targetFor(uint32_t base)
+        {
+            auto found = g_targetOfBase.find(base);
+            if (found != g_targetOfBase.end())
+                return found->second;
+            const uint8_t n = static_cast<uint8_t>(1u + g_targetOfBase.size() % 7u); // 1..7
+            for (auto it = g_targetOfBase.begin(); it != g_targetOfBase.end();)
+                it = it->second == n ? g_targetOfBase.erase(it) : std::next(it);
+            return g_targetOfBase[base] = n;
+        }
+        // The renderer source for a place (0: not one of the game's own pictures); sets the material to sample it.
+        bool sampleMade(uint32_t base, ps2x::native::Material &material)
+        {
+            if (base == g_frameBase && (base != g_backBase || !g_backAsked))
+                material.source = 0;
+            else if (base == g_backBase)
+                material.source = ps2x::native::Material::kPreviousFrame;
+            else if (const auto found = g_targetOfBase.find(base); found != g_targetOfBase.end())
+                material.source = found->second;
+            else
+                return false;
+            material.textured = true;
+            material.fromFrame = 1;
+            material.frameWidth = 640;
+            material.frameHeight = 224;
+            return true;
+        }
         // A strip of four corners (v0 v1 v2, v1 v2 v3), textured with the record's texture when there is one.
         void drawStrip(const uint8_t *rdram, uint32_t record, const Corner (&c)[4], bool flat = false)
         {
-            if (record != 0u && record == g_balloonRecord)
+            ps2x::native::Material made;
+            if (record != 0u && sampleMade(static_cast<uint32_t>(rd64(rdram, record + 0x28u) & 0x3FFFu), made))
             {
-                ps2x::native::Material material;
-                material.textured = true;
-                material.fromFrame = 1;
-                material.source = 1;
+                ps2x::native::Material material = made;
+                ++g_stats.madeDraws[std::min<uint32_t>(made.source, 8u)];
+                static const bool s_noMade = std::getenv("DC_NO_MADE") != nullptr; // diagnosis
+                if (s_noMade)
+                    return;
+                static int s_logged = 0;
+                if (std::getenv("DC_PROBE_2D") && s_logged++ < 12)
+                    std::fprintf(stderr, "[dc:2d] sprite of record %08x samples source %u: (%.1f %.1f)-(%.1f %.1f) uv (%.0f %.0f)-(%.0f %.0f) rgba %08x\n",
+                                 record, made.source, c[0].x, c[0].y, c[3].x, c[3].y, c[0].u, c[0].v, c[3].u, c[3].v, c[0].rgba);
                 material.frameWidth = 640;
                 material.frameHeight = 224;
                 material.blend = ps2x::native::blendOf(g_alpha2D);
@@ -2323,7 +2397,10 @@ namespace dc::native
         {
             ctx->pc = getRegU32(ctx, 31);
             const uint32_t cls = getRegU32(ctx, 4);
-            g_balloonRecord = textureRecord(rdram, 0x00299A78u);
+            const uint32_t balloonRecord = textureRecord(rdram, 0x00299A78u);
+            if (balloonRecord == 0u)
+                return;
+            const uint8_t balloon = targetFor(static_cast<uint32_t>(rd64(rdram, balloonRecord + 0x28u) & 0x3FFFu));
             auto i32 = [&](uint32_t offset) { return static_cast<int32_t>(rd32(rdram, cls + offset)); };
             const float t = rdf(rdram, cls + 0x90u);
             auto lerp = [&](uint32_t a, uint32_t b) { return static_cast<int32_t>(static_cast<float>(i32(a)) + (static_cast<float>(i32(b)) - static_cast<float>(i32(a))) * t); };
@@ -2333,7 +2410,7 @@ namespace dc::native
             clear.blend = ps2x::native::Material::Blend::Opaque;
             clear.depthTest = false;
             clear.depthWrite = false;
-            clear.target = 1;
+            clear.target = balloon;
             std::vector<ps2x::native::Vertex> vertices;
             quad(vertices, kOriginX, kOriginY, kOriginX + 640.0f, kOriginY + 224.0f, 0.0f, 0u);
             drawScreen(clear, vertices);
@@ -2419,7 +2496,7 @@ namespace dc::native
             shape.blend = ps2x::native::Material::Blend::Alpha;
             shape.depthTest = false;
             shape.depthWrite = false;
-            shape.target = 1;
+            shape.target = balloon;
             drawScreen(shape, vertices);
         }
 
@@ -2461,6 +2538,57 @@ namespace dc::native
             g_alpha2D = saved;
         }
 
+        // MGGetFBuffTex / MGGetFBuffBackTex (0x12F130 / 0x12F1A0, a0 the sceGsTex0 they fill): where the game's frame
+        // and the frame before are, as the game itself works them out.
+        PS2Runtime::RecompiledFunction g_getFrameTex = nullptr, g_getBackTex = nullptr;
+        void getFrameTexHook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+        {
+            const uint32_t out = getRegU32(ctx, 4);
+            g_getFrameTex(rdram, ctx, runtime);
+            g_frameBase = static_cast<uint32_t>(rd64(rdram, out) & 0x3FFFu);
+            g_backAsked = false;
+        }
+        void getBackTexHook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+        {
+            const uint32_t out = getRegU32(ctx, 4);
+            g_getBackTex(rdram, ctx, runtime);
+            g_backBase = static_cast<uint32_t>(rd64(rdram, out) & 0x3FFFu);
+            g_backAsked = true;
+        }
+        // MGStretchMoveImage (0x12F430: a0 / a1 the source's TEX0 and rectangle, a2 / a3 the destination's; rectangles in
+        // 1/16 pixels): the game stretching its frame (or the frame before, or a work texture) into a work texture. Here
+        // a draw of that source into the destination's offscreen target, stretched. Texture to texture copies (none
+        // seen so far) are counted and not made.
+        void stretchMoveHook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *)
+        {
+            ctx->pc = getRegU32(ctx, 31);
+            const uint32_t srcBase = static_cast<uint32_t>(rd64(rdram, getRegU32(ctx, 4)) & 0x3FFFu);
+            const uint32_t dstBase = static_cast<uint32_t>(rd64(rdram, getRegU32(ctx, 6)) & 0x3FFFu);
+            const Rect from = rectAt(rdram, getRegU32(ctx, 5)), to = rectAt(rdram, getRegU32(ctx, 7));
+            ps2x::native::Material material;
+            if (!sampleMade(srcBase, material) || dstBase == g_frameBase || dstBase == g_backBase)
+            {
+                ++g_stats.stretchesMissed;
+                return;
+            }
+            material.target = targetFor(dstBase);
+            material.blend = ps2x::native::Material::Blend::Opaque;
+            material.depthTest = false;
+            material.depthWrite = false;
+            material.clampU = material.clampV = true;
+            std::vector<ps2x::native::Vertex> vertices;
+            quad(vertices, kOriginX + static_cast<float>(to.x) / 16.0f, kOriginY + static_cast<float>(to.y) / 16.0f,
+                 kOriginX + static_cast<float>(to.x + to.w) / 16.0f, kOriginY + static_cast<float>(to.y + to.h) / 16.0f, 0.0f, 0x80808080u,
+                 static_cast<float>(from.x) / 16.0f / 640.0f, static_cast<float>(from.y) / 16.0f / 224.0f,
+                 static_cast<float>(from.x + from.w) / 16.0f / 640.0f, static_cast<float>(from.y + from.h) / 16.0f / 224.0f);
+            drawScreen(material, vertices);
+            ++g_stats.stretches;
+            static int s_logged = 0;
+            if (std::getenv("DC_PROBE_2D") && s_logged++ < 6)
+                std::fprintf(stderr, "[dc:2d] stretch base %x (frame %x back %x) %d,%d %dx%d -> base %x target %u %d,%d %dx%d\n", srcBase, g_frameBase,
+                             g_backBase, from.x, from.y, from.w, from.h, dstBase, material.target, to.x, to.y, to.w, to.h);
+        }
+
         // SetClut (0x14C5A0: a1 the texture whose CBP takes the palette, a2 the palette).
         void setClutHook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *)
         {
@@ -2471,10 +2599,51 @@ namespace dc::native
         }
 
         // The ALPHA the game sets for its 2D (setAlphaFlag 0x15BC20: a1 its sceGsAlpha; MGSetGsALPHA 0x12EF90: a0).
-        PS2Runtime::RecompiledFunction g_setAlphaFlag = nullptr, g_setGsAlpha = nullptr;
+        PS2Runtime::RecompiledFunction g_setAlphaFlag = nullptr, g_setGsAlpha = nullptr, g_setEnv = nullptr;
+        // DC_PROBE_2D=1: each distinct (routine, caller, ALPHA) that sets the 2D blend, once.
+        void noteAlpha(const char *who, R5900Context *ctx)
+        {
+            static const bool s_probe = [] { const char *e = std::getenv("DC_PROBE_2D"); return e && e[0] == '1'; }();
+            static std::unordered_map<uint64_t, bool> s_seen;
+            const uint64_t key = g_alpha2D ^ static_cast<uint64_t>(getRegU32(ctx, 31)) << 40;
+            if (s_probe && !s_seen[key])
+            {
+                s_seen[key] = true;
+                std::fprintf(stderr, "[dc:2d] ALPHA %llx from %s, called from %08x\n", static_cast<unsigned long long>(g_alpha2D), who,
+                             getRegU32(ctx, 31));
+            }
+        }
+        // MGDrawShadow / MGDrawShadowFast / MGDrawShadowFast2 (0x1305F0 / 0x1303B0 / 0x1304D0): the characters' blob
+        // shadows set their own ALPHA (0x2A) and restore the state with a prebuilt packet (sceVif1PkCall), which is not
+        // read: the 2D blend is kept as it was around them.
+        struct ShadowCall
+        {
+            uint32_t address;
+            PS2Runtime::RecompiledFunction original;
+        };
+        ShadowCall g_shadowCalls[] = {{0x001305F0u, nullptr}, {0x001303B0u, nullptr}, {0x001304D0u, nullptr}};
+        void blobShadowHook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+        {
+            const uint64_t saved = g_alpha2D;
+            for (ShadowCall &call : g_shadowCalls)
+                if (call.address == ctx->pc && call.original)
+                {
+                    call.original(rdram, ctx, runtime);
+                    break;
+                }
+            g_alpha2D = saved;
+        }
+        // SetEnv (0x140DA0): the frame's default state, ALPHA among it (mgAlpha, gp - 0x7408).
+        void setEnvHook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+        {
+            g_alpha2D = rd64(rdram, getRegU32(ctx, 28) - 0x7408u);
+            noteAlpha("SetEnv", ctx);
+            g_setEnv(rdram, ctx, runtime);
+        }
         void setAlphaFlagHook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
         {
             g_alpha2D = rd64(rdram, getRegU32(ctx, 5));
+            noteAlpha("setAlphaFlag", ctx);
             g_setAlphaFlag(rdram, ctx, runtime);
         }
         void setGsAlphaHook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -2482,7 +2651,18 @@ namespace dc::native
             // A null argument restores the game's default, mgAlpha (gp - 0x7408), as MGSetGsALPHA does.
             const uint32_t alpha = getRegU32(ctx, 4);
             g_alpha2D = rd64(rdram, alpha != 0u ? alpha : getRegU32(ctx, 28) - 0x7408u);
+            noteAlpha(alpha != 0u ? "MGSetGsALPHA" : "MGSetGsALPHA(default)", ctx);
             g_setGsAlpha(rdram, ctx, runtime);
+        }
+
+        // VSyncCallBack_Load (0x154320): while the game loads, its vsync callback draws the loading picture (the SCE and
+        // Level-5 logos at boot) and shows it itself; the main loop, which publishes the native frame, is waiting. The
+        // native frame built since the last one is published from there too.
+        PS2Runtime::RecompiledFunction g_vsyncLoad = nullptr;
+        void vsyncLoadHook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+        {
+            g_vsyncLoad(rdram, ctx, runtime);
+            ::dc::native::publish();
         }
 
         bool g_enabled = false;
@@ -2587,6 +2767,14 @@ namespace dc::native
             runtime.registerFunction(0x0012F210u, &moveImageHook);
             runtime.registerFunction(0x00151AD0u, &balloonHook);
             runtime.registerFunction(0x00140660u, &moveImageTestHook);
+            if ((g_getFrameTex = runtime.lookupFunction(0x0012F130u)) && (g_getBackTex = runtime.lookupFunction(0x0012F1A0u)))
+            {
+                runtime.registerFunction(0x0012F130u, &getFrameTexHook);
+                runtime.registerFunction(0x0012F1A0u, &getBackTexHook);
+            }
+            runtime.registerFunction(0x0012F430u, &stretchMoveHook);
+            if ((g_vsyncLoad = runtime.lookupFunction(0x00154320u)))
+                runtime.registerFunction(0x00154320u, &vsyncLoadHook);
             if ((g_drawFire = runtime.lookupFunction(0x00161AC0u)))
                 runtime.registerFunction(0x00161AC0u, &drawFireHook);
             if ((g_setAlphaFlag = runtime.lookupFunction(0x0015BC20u)) && (g_setGsAlpha = runtime.lookupFunction(0x0012EF90u)))
@@ -2594,6 +2782,11 @@ namespace dc::native
                 runtime.registerFunction(0x0015BC20u, &setAlphaFlagHook);
                 runtime.registerFunction(0x0012EF90u, &setGsAlphaHook);
             }
+            if ((g_setEnv = runtime.lookupFunction(0x00140DA0u)))
+                runtime.registerFunction(0x00140DA0u, &setEnvHook);
+            for (ShadowCall &call : g_shadowCalls)
+                if ((call.original = runtime.lookupFunction(call.address)))
+                    runtime.registerFunction(call.address, &blobShadowHook);
         }
         g_enabled = true;
         std::fprintf(stderr, "[dc:native] 3D models drawn natively from the game's MDT models, RenderInfo and textures; VU1 runs nothing\n");
@@ -2632,6 +2825,15 @@ namespace dc::native
             std::fprintf(stderr, "[dc:native] objects without Z write (ZBUF ZMSK): %llu; depths of field: %llu; back faces culled: %llu; outside the guard band: %llu\n",
                          static_cast<unsigned long long>(g_stats.noZWrite), static_cast<unsigned long long>(g_stats.depthOfFields),
                          static_cast<unsigned long long>(g_stats.culled), static_cast<unsigned long long>(g_stats.guarded));
+            if (g_stats.madeDraws[0] + g_stats.madeDraws[1] + g_stats.madeDraws[8] + g_stats.clears != 0u)
+                std::fprintf(stderr, "[dc:native] made-picture sprites: frame %llu, previous %llu, targets %llu %llu %llu; clears %llu (last %06llx)\n",
+                             static_cast<unsigned long long>(g_stats.madeDraws[0]), static_cast<unsigned long long>(g_stats.madeDraws[8]),
+                             static_cast<unsigned long long>(g_stats.madeDraws[1]), static_cast<unsigned long long>(g_stats.madeDraws[2]),
+                             static_cast<unsigned long long>(g_stats.madeDraws[3]), static_cast<unsigned long long>(g_stats.clears),
+                             static_cast<unsigned long long>(g_stats.lastClear));
+            if (g_stats.stretches + g_stats.stretchesMissed != 0u)
+                std::fprintf(stderr, "[dc:native] frame stretches: %llu, %llu from or to a place not made natively\n",
+                             static_cast<unsigned long long>(g_stats.stretches), static_cast<unsigned long long>(g_stats.stretchesMissed));
             if (g_stats.textureCopies != 0u)
                 std::fprintf(stderr, "[dc:native] texture copies: %llu, %llu between places no record holds\n",
                              static_cast<unsigned long long>(g_stats.textureCopies), static_cast<unsigned long long>(g_stats.textureCopiesMissed));
