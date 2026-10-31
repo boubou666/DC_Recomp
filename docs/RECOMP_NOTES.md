@@ -202,3 +202,15 @@ from the ELF's own symbols.
   program is a DrawVu1 model. The other VU1 users in the code never ran there: CVisualShadow (shadows),
   CCloth::DrawVu1 (0x13C470), CWater::DrawVu1 (0x160F20); CEffect::Draw runs in Norune (900-30,000 calls per 300
   frames) without starting a VU1 program. They need a scripted run into gameplay (Toan's control, a dungeon) first.
+- Into gameplay, cloth and shadows (2026-10-31): `build/boot16.pad` (the opening, then X every 0.5 s) reaches
+  Norune's opening scenes, where CCloth::DrawVu1 (about 3 per frame) and CVisualShadow::DrawVu1 (about 9 per frame)
+  run. Their programs were skipped without native batches numbered for them, so every later batch landed at the wrong
+  place in the GS stream (black frames). Both are taken over now: no VU data, packet or VU1 program for them. Cloth is
+  drawn natively from its own simulation grid (CCloth + 0x1110 positions, + 0x5110 normals, + 0x6110 texture
+  coordinates, CreateVUData's strip order). Shadows are not drawn yet: their colour comes from the shadow program
+  (images 755a / 69a6, VU 22 = RenderInfo + 0x328..), still to read. Water (CWater::DrawVu1) has not run yet.
+- BaldHuman's texture rule for DC (via VP2S, 2026-10-31): plain TIM2 pixels and palettes from the game's records are
+  decoded at runtime; texels stored in GS memory order (records with + 0x4C set) only through an offline conversion of
+  the disc's files, no GS layout function in the game. The runtime un-swizzle is removed. Those textures are about 97%
+  of the model draws: the 3D is untextured until the offline converter (disc IMG files -> native images in the build
+  tree, loaded by the record's name and size at the record hook) exists.

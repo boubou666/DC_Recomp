@@ -20,7 +20,6 @@
 // DC_NATIVE3D=1 turns it on.
 
 #include "ps2_runtime.h"
-#include "runtime/gs/ps2_gs_memory.h"
 #include "runtime/native/native_renderer.h"
 #include "runtime/native/native_vif1.h"
 
@@ -53,7 +52,7 @@ namespace dc::native
         struct Stats
         {
             uint64_t calls = 0, noModel = 0, primitives = 0, triangles = 0, shadows = 0, screenSpace = 0;
-            uint64_t ownTextures = 0, noTexture = 0;
+            uint64_t ownTextures = 0, noTexture = 0, gsOrderTextures = 0, cloths = 0;
         } g_stats;
         std::atomic<uint64_t> g_gateSkipped{0};
 
@@ -358,7 +357,6 @@ namespace dc::native
             return 0u;
         }
 
-        std::vector<uint8_t> g_unswizzle; // a GS-layout scratch for assets stored pre-swizzled
         std::unordered_map<uint32_t, std::pair<uint64_t, std::shared_ptr<const ps2x::native::TextureCache::Texture>>> g_decoded;
         uint64_t g_textureVersion = 0;
 
@@ -370,7 +368,10 @@ namespace dc::native
         }
 
         // A record's texture, decoded from its pixels and palette in main memory (8-bit / 4-bit with a CT32 palette as
-        // the game sends it: CSM1 entry order, CSA; CT32). An identical asset keeps its decoded texture.
+        // the game sends it: CSM1 entry order, CSA; CT32). An identical asset keeps its decoded texture. Records whose
+        // 8-bit texels are stored in GS memory order (flag + 0x4C: the game sends them as a CT32 image of half the
+        // width) are not decoded here: by BaldHuman's rule no GS layout function runs in the game; they are to come
+        // from an offline conversion of the disc's texture files, and draw untextured until then.
         std::shared_ptr<const ps2x::native::TextureCache::Texture> recordTexture(const uint8_t *rdram, uint32_t record)
         {
             const uint32_t w = rd32(rdram, record) >> 16, h = rd32(rdram, record + 4u) & 0xFFFFu;
@@ -378,9 +379,13 @@ namespace dc::native
             const uint64_t tex0 = rd64(rdram, record + 0x28u);
             const uint32_t pixels = rd32(rdram, record + 0x38u);
             const uint32_t palette = kind == 1u ? rd32(rdram, record + 0x48u) : 0u;
-            const bool sentAs32 = kind == 1u && rd32(rdram, record + 0x4Cu) != 0u;
+            if (kind == 1u && rd32(rdram, record + 0x4Cu) != 0u)
+            {
+                ++g_stats.gsOrderTextures;
+                return nullptr;
+            }
             const uint32_t bytes = (kind == 1u ? 1u : 4u) * w * h; // ReloadTexture's level 0: kind x w x h / 16 qwords
-            const uint32_t tbp = tex0 & 0x3FFFu, tbw = std::max<uint32_t>((tex0 >> 14) & 0x3Fu, 1u);
+            const uint32_t tbw = std::max<uint32_t>((tex0 >> 14) & 0x3Fu, 1u);
             const uint32_t psm = (tex0 >> 20) & 0x3Fu;
             const uint32_t tw = (tex0 >> 26) & 0xFu, th = (tex0 >> 30) & 0xFu;
             const uint32_t cpsm = (tex0 >> 51) & 0xFu, csa = (tex0 >> 56) & 0x1Fu;
@@ -407,18 +412,7 @@ namespace dc::native
             const uint32_t rows = bytes * 8u / (rowTexels * bitsPerTexel);
             auto alpha = [](uint32_t a) { return a >= 0x80u ? 255u : a * 2u; };
             auto colour = [&](uint32_t c) { return (c & 0x00FFFFFFu) | alpha(c >> 24) << 24; };
-            // 8-bit texels stored for a CT32 send (half the width): laid out as that image is, read back as 8-bit.
-            const uint32_t bw32 = std::max<uint32_t>(tbw / 2u, 1u), width32 = bw32 * 64u;
-            const uint32_t rows32 = sentAs32 ? bytes / (width32 * 4u) : 0u;
-            if (sentAs32)
-            {
-                g_unswizzle.resize(4u * 1024u * 1024u);
-                for (uint32_t y = 0; y < rows32; ++y)
-                    for (uint32_t x = 0; x < width32; ++x)
-                        GSMem::WriteCT32(g_unswizzle.data(), tbp, bw32, x, y, rd32(rdram, pixels + (y * width32 + x) * 4u));
-            }
-            const uint32_t texelRows = sentAs32 ? rows32 * 2u : rows;
-            for (uint32_t y = 0; y < texture->height && y < texelRows; ++y)
+            for (uint32_t y = 0; y < texture->height && y < rows; ++y)
                 for (uint32_t x = 0; x < texture->width && x < rowTexels; ++x)
                 {
                     uint32_t texel = 0;
@@ -427,10 +421,7 @@ namespace dc::native
                     else
                     {
                         uint32_t index = 0;
-                        if (sentAs32)
-                            index = psm == 0x13u ? GSMem::ReadP8(g_unswizzle.data(), tbp, tbw, x, y)
-                                                 : GSMem::ReadP4(g_unswizzle.data(), tbp, tbw, x, y);
-                        else if (psm == 0x13u)
+                        if (psm == 0x13u)
                             index = rdram[(pixels + y * rowTexels + x) & 0x1FFFFFFu];
                         else
                         {
@@ -451,17 +442,81 @@ namespace dc::native
         // name is at + 0x34. Its record, found once per material.
         std::unordered_map<uint32_t, uint32_t> g_materialRecord;
 
+        // What DrawVu1 sets up for a piece, redone from RenderInfo: clip = RenderInfo 0x230 x 0x10 x the local-to-world
+        // matrix (the microprogram's clip box), RenderInfo 0x270 from there to GS screen space, the lights in the
+        // piece's space, and whether it is textured (PRMODE TME: no shadow, RenderInfo + 0x340 clear).
+        struct DrawSetup
+        {
+            Matrix clip, toScreen;
+            Lighting lighting;
+            float uvScale = 1.0f;
+            bool textureMapped = true;
+        };
+        DrawSetup drawSetup(const uint8_t *rdram, const Matrix &localToWorld, uint32_t renderInfo)
+        {
+            DrawSetup setup;
+            setup.clip = mul(mul(load(rdram, renderInfo + 0x230u), load(rdram, renderInfo + 0x10u)), localToWorld);
+            setup.toScreen = mul(load(rdram, renderInfo + 0x270u), setup.clip);
+            setup.lighting = lightingFor(g_lights, localToWorld);
+            setup.uvScale = g_lights.uvScale;
+            setup.textureMapped = rd32(rdram, renderInfo + 0x320u) == 0u && rd32(rdram, renderInfo + 0x340u) == 0u;
+            return setup;
+        }
+
+        void readLights(const uint8_t *rdram, uint32_t renderInfo)
+        {
+            for (int j = 0; j < 3; ++j)
+                for (int c = 0; c < 4; ++c)
+                    g_lights.dirs[j][c] = rdf(rdram, renderInfo + 0x110u + static_cast<uint32_t>(j) * 16u + static_cast<uint32_t>(c) * 4u);
+            for (int k = 0; k < 4; ++k)
+                for (int c = 0; c < 4; ++c)
+                    g_lights.colour[k][c] = rdf(rdram, renderInfo + 0x150u + static_cast<uint32_t>(k) * 16u + static_cast<uint32_t>(c) * 4u);
+            for (int c = 0; c < 4; ++c)
+                g_lights.ambient[c] = rdf(rdram, renderInfo + 0x190u + static_cast<uint32_t>(c) * 4u);
+            g_lights.uvScale = rdf(rdram, renderInfo + 0x1A0u);
+            if (!(g_lights.uvScale > 0.0f && g_lights.uvScale <= 16.0f))
+                g_lights.uvScale = 1.0f;
+        }
+
+        // Clipped to the near and far planes, then drawn with the decoded texture (untextured without one).
+        void submit(const DrawSetup &setup, ps2x::native::Material &material,
+                    const std::shared_ptr<const ps2x::native::TextureCache::Texture> &texture,
+                    std::vector<ps2x::native::Vertex> &vertices)
+        {
+            clipDepth(setup.clip, vertices);
+            if (vertices.empty())
+                return;
+            ps2x::native::Renderer &renderer = ps2x::native::Renderer::instance();
+            material.textured = setup.textureMapped && texture != nullptr;
+            g_stats.triangles += vertices.size() / 3u;
+            if (material.textured)
+            {
+                ++g_stats.ownTextures;
+                renderer.draw(material, setup.toScreen.m, vertices.data(), static_cast<uint32_t>(vertices.size()), texture);
+            }
+            else
+            {
+                g_stats.noTexture += setup.textureMapped ? 1u : 0u;
+                renderer.draw(material, setup.toScreen.m, vertices.data(), static_cast<uint32_t>(vertices.size()));
+            }
+        }
+
+        // A material's colour (its first quadword, VU 37 for the program) and its texture record.
+        uint32_t materialRecord(const uint8_t *rdram, uint32_t mat)
+        {
+            auto found = g_materialRecord.find(mat);
+            return found != g_materialRecord.end() ? found->second : (g_materialRecord[mat] = textureRecord(rdram, mat + 0x34u));
+        }
+
         // One model piece, from its MDT: + 0x10 positions, + 0x18 normals, + 0x20 colours (none when <= 0), + 0x28
         // the primitives (count at + 8, from + 0x10: type (4 strip, 3 list), vertex count, material (-1: the one
         // before), then per vertex the indices of its position, normal, texture coordinates and colour), + 0x30 texture
         // coordinates (the positions when <= 0), + 0x38 the materials.
         void drawModel(const uint8_t *rdram, uint32_t mdt, const Matrix &localToWorld, uint32_t renderInfo, bool drawn)
         {
-            const Matrix clip = mul(mul(load(rdram, renderInfo + 0x230u), load(rdram, renderInfo + 0x10u)), localToWorld);
-            const Matrix toScreen = mul(load(rdram, renderInfo + 0x270u), clip);
-            Lighting lighting = lightingFor(g_lights, localToWorld);
-            const float uvScale = g_lights.uvScale;
-            const bool textureMapped = rd32(rdram, renderInfo + 0x320u) == 0u && rd32(rdram, renderInfo + 0x340u) == 0u;
+            DrawSetup setup = drawSetup(rdram, localToWorld, renderInfo);
+            Lighting &lighting = setup.lighting;
+            const float uvScale = setup.uvScale;
 
             const uint32_t positions = mdt + rd32(rdram, mdt + 0x10u), normals = mdt + rd32(rdram, mdt + 0x18u);
             const int32_t colourOffset = static_cast<int32_t>(rd32(rdram, mdt + 0x20u));
@@ -492,9 +547,7 @@ namespace dc::native
                     const uint32_t mat = materials + static_cast<uint32_t>(materialIndex) * 0x60u;
                     for (int c = 0; c < 4; ++c)
                         lighting.material[c] = rdf(rdram, mat + static_cast<uint32_t>(c) * 4u);
-                    auto found = g_materialRecord.find(mat);
-                    const uint32_t record = found != g_materialRecord.end() ? found->second
-                                                                            : (g_materialRecord[mat] = textureRecord(rdram, mat + 0x34u));
+                    const uint32_t record = materialRecord(rdram, mat);
                     texture = record != 0u ? recordTexture(rdram, record) : nullptr;
                     material.tex0 = record != 0u ? rd64(rdram, record + 0x28u) : 0u;
                 }
@@ -536,21 +589,7 @@ namespace dc::native
                         vertices.push_back(vertex(i + 1));
                         vertices.push_back(vertex(i + 2));
                     }
-                clipDepth(clip, vertices);
-                if (vertices.empty())
-                    continue;
-                material.textured = textureMapped && texture != nullptr;
-                g_stats.triangles += vertices.size() / 3u;
-                if (material.textured)
-                {
-                    ++g_stats.ownTextures;
-                    renderer.draw(material, toScreen.m, vertices.data(), static_cast<uint32_t>(vertices.size()), texture);
-                }
-                else
-                {
-                    g_stats.noTexture += textureMapped ? 1u : 0u;
-                    renderer.draw(material, toScreen.m, vertices.data(), static_cast<uint32_t>(vertices.size()));
-                }
+                submit(setup, material, texture, vertices);
             }
         }
 
@@ -567,19 +606,7 @@ namespace dc::native
             if (rd32(rdram, visual + 0x18u) == 0u || rd32(rdram, visual + 0x1Cu) == 0u)
                 return; // DrawVu1 drew nothing (no VU data)
             if (newLights)
-            {
-                for (int j = 0; j < 3; ++j)
-                    for (int c = 0; c < 4; ++c)
-                        g_lights.dirs[j][c] = rdf(rdram, renderInfo + 0x110u + static_cast<uint32_t>(j) * 16u + static_cast<uint32_t>(c) * 4u);
-                for (int k = 0; k < 4; ++k)
-                    for (int c = 0; c < 4; ++c)
-                        g_lights.colour[k][c] = rdf(rdram, renderInfo + 0x150u + static_cast<uint32_t>(k) * 16u + static_cast<uint32_t>(c) * 4u);
-                for (int c = 0; c < 4; ++c)
-                    g_lights.ambient[c] = rdf(rdram, renderInfo + 0x190u + static_cast<uint32_t>(c) * 4u);
-                g_lights.uvScale = rdf(rdram, renderInfo + 0x1A0u);
-                if (!(g_lights.uvScale > 0.0f && g_lights.uvScale <= 16.0f))
-                    g_lights.uvScale = 1.0f;
-            }
+                readLights(rdram, renderInfo);
             // Shadow volumes (RenderInfo + 0x320) and the screen-space program (0xF) are not drawn yet.
             const bool shadow = rd32(rdram, renderInfo + 0x320u) != 0u, screenSpace = program == 0xFu;
             g_stats.shadows += shadow ? 1u : 0u;
@@ -593,6 +620,81 @@ namespace dc::native
             g_objectState = state;
             drawModel(rdram, mdt, load(rdram, localToWorld), renderInfo, !shadow && !screenSpace);
             g_objectState.valid = false;
+        }
+
+        // CCloth::DrawVu1 (0x13C470), taken over: no VU data, packet or VU1 program; the cloth drawn from its own
+        // simulation grid (rows at + 0x2C, columns at + 0x30; vertex (r, c) at + r * 0x100 + c * 0x10 from + 0x1110 for
+        // its position, + 0x5110 its normal, + 0x6110 its texture coordinates), one strip per pair of rows as
+        // CreateVUData (0x13C5F0) lays them out (the two rows swapped when the row's flag at + 0x7110 is set), with its
+        // material at + 0x60 (texture name at + 0x94). It draws with RenderInfo's lights, as its DrawVu1 call asks.
+        constexpr uint32_t kClothDrawVu1 = 0x0013C470u;
+        void clothDrawHook(uint8_t *rdram, R5900Context *ctx, PS2Runtime *)
+        {
+            const uint32_t cloth = getRegU32(ctx, 4), localToWorld = getRegU32(ctx, 6), renderInfo = getRegU32(ctx, 7);
+            const ObjectState state = g_objectState;
+            g_objectState.valid = false;
+            setReturnS32(ctx, 0); // nothing added to the game's packet
+            ctx->pc = getRegU32(ctx, 31);
+            const int32_t rows = static_cast<int32_t>(rd32(rdram, cloth + 0x2Cu));
+            const int32_t columns = static_cast<int32_t>(rd32(rdram, cloth + 0x30u));
+            if (rows < 2 || columns < 1 || rows > 64 || columns > 16)
+                return;
+            ++g_stats.cloths;
+            readLights(rdram, renderInfo);
+            DrawSetup setup = drawSetup(rdram, load(rdram, localToWorld), renderInfo);
+            const uint32_t mat = cloth + 0x60u;
+            for (int c = 0; c < 4; ++c)
+                setup.lighting.material[c] = rdf(rdram, mat + static_cast<uint32_t>(c) * 4u);
+            const uint32_t record = materialRecord(rdram, mat);
+            auto texture = record != 0u ? recordTexture(rdram, record) : nullptr;
+            ps2x::native::Material material;
+            material.depthTest = true;
+            material.tex0 = record != 0u ? rd64(rdram, record + 0x28u) : 0u;
+            applyObjectState(state, material);
+            auto vertex = [&](int32_t r, int32_t c) {
+                const uint32_t at = cloth + static_cast<uint32_t>(r) * 0x100u + static_cast<uint32_t>(c) * 0x10u;
+                ps2x::native::Vertex v;
+                v.x = rdf(rdram, at + 0x1110u);
+                v.y = rdf(rdram, at + 0x1114u);
+                v.z = rdf(rdram, at + 0x1118u);
+                v.u = rdf(rdram, at + 0x6110u) * setup.uvScale;
+                v.v = rdf(rdram, at + 0x6114u) * setup.uvScale;
+                v.rgba = shade(setup.lighting, rdf(rdram, at + 0x5110u), rdf(rdram, at + 0x5114u), rdf(rdram, at + 0x5118u));
+                return v;
+            };
+            std::vector<ps2x::native::Vertex> strip, vertices;
+            for (int32_t r = 0; r + 1 < rows; ++r)
+            {
+                const bool swapped = rd32(rdram, cloth + 0x7110u + static_cast<uint32_t>(r) * 4u) != 0u;
+                strip.clear();
+                for (int32_t c = 0; c < columns; ++c)
+                {
+                    strip.push_back(vertex(swapped ? r + 1 : r, c));
+                    strip.push_back(vertex(swapped ? r : r + 1, c));
+                }
+                for (size_t i = 2; i < strip.size(); ++i)
+                {
+                    ps2x::native::Vertex a = strip[i - 2], b = strip[i - 1];
+                    if (i & 1u)
+                        std::swap(a, b);
+                    vertices.push_back(a);
+                    vertices.push_back(b);
+                    vertices.push_back(strip[i]);
+                }
+            }
+            submit(setup, material, texture, vertices);
+        }
+
+        // CVisualShadow::DrawVu1 (0x136290), taken over: no VU data, packet or VU1 program. The shadow (the model's
+        // MDT positions through RenderInfo's shadow matrix at + 0x2D0, drawn with the shadow program's colour) is not
+        // drawn yet.
+        constexpr uint32_t kShadowDrawVu1 = 0x00136290u;
+        void shadowDrawHook(uint8_t *, R5900Context *ctx, PS2Runtime *)
+        {
+            g_objectState.valid = false;
+            ++g_stats.shadows;
+            setReturnS32(ctx, 0);
+            ctx->pc = getRegU32(ctx, 31);
         }
 
         // DC_PROBE_TEX=1 (diagnosis): DC's 2D sprite functions (packet, CTexture *, const CRect &dst, ...): each
@@ -708,6 +810,8 @@ namespace dc::native
         runtime.registerFunction(kCreateFromMdt, &createFromMdtHook);
         runtime.registerFunction(kCreateFromMdtRemake, &createFromMdtRemakeHook);
         runtime.registerFunction(kSetGsReg3, &setGsReg3Hook);
+        runtime.registerFunction(kClothDrawVu1, &clothDrawHook);
+        runtime.registerFunction(kShadowDrawVu1, &shadowDrawHook);
         ps2x::native::Renderer &renderer = ps2x::native::Renderer::instance();
         renderer.setEnabled(true);
         renderer.beginFrame(screen());
@@ -729,7 +833,7 @@ namespace dc::native
         {
             std::fprintf(stderr, "[dc:native] per 300 frames: %llu DrawVu1 calls (%llu without a known MDT), %llu primitives, "
                                  "%llu triangles, %llu own textures, %llu untextured for lack of one; not drawn: %llu shadows, "
-                                 "%llu screen-space; VU1 programs skipped: %llu\n",
+                                 "%llu screen-space; %llu cloths; %llu GS-order textures (offline conversion pending); VU1 programs skipped: %llu\n",
                          static_cast<unsigned long long>(g_stats.calls), static_cast<unsigned long long>(g_stats.noModel),
                          static_cast<unsigned long long>(g_stats.primitives),
                          static_cast<unsigned long long>(g_stats.triangles),
@@ -737,6 +841,8 @@ namespace dc::native
                          static_cast<unsigned long long>(g_stats.noTexture),
                          static_cast<unsigned long long>(g_stats.shadows),
                          static_cast<unsigned long long>(g_stats.screenSpace),
+                         static_cast<unsigned long long>(g_stats.cloths),
+                         static_cast<unsigned long long>(g_stats.gsOrderTextures),
                          static_cast<unsigned long long>(g_gateSkipped.exchange(0)));
             std::fprintf(stderr, "[dc:native] groups: %llu numbered here; skipped at pc 0: %llu, pc 8: %llu, other: %llu (last 0x%llx)\n",
                          static_cast<unsigned long long>(g_group), static_cast<unsigned long long>(g_gateByPc[0].exchange(0)),
